@@ -4,10 +4,11 @@ cargo-features = ["panic-immediate-abort"]
 name = "rustclip"
 version = "1.0.0"
 edition = "2024"
+description = "A wl-clipboard like utility."
 
 [dependencies]
 libc = { version = "0.2.186", default-features = false }
-wllib = { path = "../wllib" }
+wllib = { git = "https://github.com/spaceavenue/wllib.git" }
 
 [[bin]]
 name = "wl-paste"
@@ -26,6 +27,5 @@ panic = "immediate-abort"
 opt-level = "z"
 lto = "fat"
 codegen-units = 1
-debug = "none"
 strip = true
 panic = "immediate-abort"
