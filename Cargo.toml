@@ -1,0 +1,31 @@
+cargo-features = ["panic-immediate-abort"]
+
+[package]
+name = "rustclip"
+version = "1.0.0"
+edition = "2024"
+
+[dependencies]
+libc = { version = "0.2.186", default-features = false }
+wllib = { path = "../wllib" }
+
+[[bin]]
+name = "wl-paste"
+path = "src/wl-paste.rs"
+[[bin]]
+name = "wl-watch"
+path = "src/wl-watch.rs"
+[[bin]]
+name = "wl-copy"
+path = "src/wl-copy.rs"
+
+[profile.dev]
+panic = "immediate-abort"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+debug = "none"
+strip = true
+panic = "immediate-abort"
