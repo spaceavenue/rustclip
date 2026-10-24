@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+use core::ffi::{c_char, c_int};
+
 use rustclip::mime::{self, MimeType};
 use rustclip::state::{Action, State};
 use rustix::stdio;
@@ -16,8 +18,8 @@ use wllib::wire::Message;
 unsafe extern "C" {}
 
 unsafe extern "C" {
-  static optarg: *const libc::c_char;
-  static mut optind: libc::c_int;
+  static optarg: *const c_char;
+  static mut optind: c_int;
 }
 
 const OPTSTRING: *const i8 = c"plnt:".as_ptr();
@@ -32,7 +34,7 @@ const LONGOPTS: [cli::LongOption; 6] = [
 ];
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn main(argc: isize, argv: *const *mut libc::c_char) -> libc::c_int {
+pub unsafe extern "C" fn main(argc: isize, argv: *const *mut c_char) -> c_int {
   let mut use_primary = false;
   let mut list_types = false;
   let mut no_newline = false;
@@ -78,7 +80,7 @@ pub unsafe extern "C" fn main(argc: isize, argv: *const *mut libc::c_char) -> li
     Ok(c) => c,
     Err(e) => {
       e.write_diagnostic();
-      unsafe { libc::exit(1) };
+      return 1;
     }
   };
   let action = if list_types {
@@ -90,16 +92,16 @@ pub unsafe extern "C" fn main(argc: isize, argv: *const *mut libc::c_char) -> li
 
   if let Err(e) = crawl(&mut conn, &mut state) {
     e.write_diagnostic();
-    unsafe { libc::exit(1) };
+    return 1;
   }
 
   if state.global.manager_id == 0 {
     write_stderr("[wl-paste]: compositor does not support wlr-data-control\n");
-    unsafe { libc::exit(1) };
+    return 1;
   }
   if state.global.seat_id == 0 {
     write_stderr("[wl-paste]: no wl_seat found\n");
-    unsafe { libc::exit(1) };
+    return 1;
   }
 
   let device_id = conn.alloc_id();
@@ -117,11 +119,11 @@ pub unsafe extern "C" fn main(argc: isize, argv: *const *mut libc::c_char) -> li
   loop {
     if let Err(e) = dispatch_once(&mut conn, &mut state) {
       e.write_diagnostic();
-      unsafe { libc::exit(1) };
+      return 1;
     }
     if state.had_empty_selection {
       write_stderr("[wl-paste]: nothing is currently copied\n");
-      unsafe { libc::exit(1) };
+      return 1;
     }
   }
 }

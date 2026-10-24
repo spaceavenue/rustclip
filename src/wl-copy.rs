@@ -7,6 +7,8 @@
 // needing more than the plain argument bytes. so, this binary runs its own loop directly on top of
 // `Connection::recv_with_fd`, and only uses `crawl`/`GlobalHandler` for the registry phase.
 
+use core::ffi::{c_char, c_int};
+
 use rustclip::error::AppError;
 use rustclip::mime::{self, GENERIC_TEXT_OFFERS, MimeType};
 use rustix::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
@@ -69,8 +71,9 @@ impl EventHandler for State {
 unsafe extern "C" {}
 
 unsafe extern "C" {
-  static optarg: *const libc::c_char;
-  static mut optind: libc::c_int;
+  static optarg: *const c_char;
+  static mut optind: c_int;
+  fn fork() -> c_int;
 }
 
 const OPTSTRING: *const i8 = c"pont:f".as_ptr();
@@ -85,13 +88,13 @@ const LONGOPTS: [cli::LongOption; 6] = [
 ];
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn main(argc: isize, argv: *const *mut libc::c_char) -> libc::c_int {
+pub unsafe extern "C" fn main(argc: isize, argv: *const *mut c_char) -> c_int {
   let mut use_primary = false;
   let mut paste_once = false;
   let mut trim_newline = false;
   let mut foreground = false;
   let mut wanted_mime: Option<MimeType> = None;
-  let mut longindex: libc::c_int = 0;
+  let mut longindex: c_int = 0;
   unsafe { optind = 1 };
 
   loop {
@@ -129,7 +132,7 @@ pub unsafe extern "C" fn main(argc: isize, argv: *const *mut libc::c_char) -> li
     }
   };
 
-  let is_stdin = optind_val >= argc as libc::c_int;
+  let is_stdin = optind_val >= argc as c_int;
   if is_stdin {
     if let Err(e) = write_stdin_to_fd(&memfd) {
       e.write_diagnostic();
@@ -228,7 +231,7 @@ pub unsafe extern "C" fn main(argc: isize, argv: *const *mut libc::c_char) -> li
   conn.send_logged(&select_msg, None);
 
   if !foreground {
-    let pid = unsafe { libc::fork() };
+    let pid = unsafe { fork() };
     if pid < 0 {
       write_stderr("[wl-copy]: failed to fork process\n");
       return 1;
@@ -284,9 +287,9 @@ fn trim_trailing_newline(fd: &OwnedFd) {
   };
   let mut last_byte = [0u8; 1];
   if size > 0 {
-    let _ = seek(&fd, SeekFrom::Start(size - 1));
+    let _ = seek(fd, SeekFrom::Start(size - 1));
   }
-  if let Ok(1) = read(&fd, &mut last_byte)
+  if let Ok(1) = read(fd, &mut last_byte)
     && last_byte[0] == b'\n'
   {
     let Ok(_) = ftruncate(fd, size - 1) else {
@@ -313,9 +316,6 @@ fn write_content_to_fd(
     }
     write_fd(target_fd, &chunk[..n], None).map_err(AppError::Sys)?;
   }
-  // if close {
-  //   unsafe { libc::close(target_fd) };
-  // }
   Ok(())
 }
 
@@ -328,7 +328,7 @@ fn write_stdin_to_fd(fd: &OwnedFd) -> Result<(), AppError> {
 /// writes argv to the given fd
 fn write_args_to_fd(
   fd: &OwnedFd,
-  argv: *const *mut libc::c_char,
+  argv: *const *mut c_char,
   start: usize,
   argc: usize,
 ) -> Result<(), AppError> {

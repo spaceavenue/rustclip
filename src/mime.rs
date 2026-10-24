@@ -18,15 +18,35 @@
 // prioritize explicit requested types, then inferred types, then UTF-8 / plain text fallbacks —
 // matching wl-clipboard's behavior of the same name.
 
+use core::ffi::{c_char, c_int};
 use core::str;
 
-use libc::{SIG_DFL, SIGHUP, SIGPIPE};
 use rustix::fd::{AsFd, AsRawFd, OwnedFd};
 use rustix::fs::{CWD, Mode, OFlags, SeekFrom, open, readlinkat_raw, seek};
 use rustix::io::read;
 use rustix::pipe::{PipeFlags, pipe_with};
 use rustix::stdio;
 use wllib::fmt_lite::StringOnStack;
+
+const SIGHUP: c_int = 1;
+const SIGPIPE: c_int = 13;
+const SIG_DFL: usize = 0;
+
+const fn wifexited(status: c_int) -> bool {
+  (status & 0x7f) == 0
+}
+
+const fn wexitstatus(status: c_int) -> c_int {
+  (status >> 8) & 0xff
+}
+
+unsafe extern "C" {
+  fn fork() -> c_int;
+  fn execvp(file: *const c_char, argv: *const *const c_char) -> c_int;
+  fn _exit(status: c_int) -> !;
+  fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
+  fn signal(signum: c_int, handler: usize) -> usize;
+}
 
 pub const MAX_MIME_LEN: usize = 128;
 pub const MAX_MIME_TYPES: usize = 128;
@@ -175,9 +195,9 @@ pub fn infer_from_name(file_path: &str) -> Option<MimeType> {
 pub fn infer_from_fd(fd: &OwnedFd) -> Option<MimeType> {
   let mut header = [0u8; 64];
 
-  seek(&fd, SeekFrom::Start(0)).ok()?;
-  let amount_read = read(&fd, &mut header).ok()?;
-  seek(&fd, SeekFrom::Start(0)).ok()?;
+  seek(fd, SeekFrom::Start(0)).ok()?;
+  let amount_read = read(fd, &mut header).ok()?;
+  seek(fd, SeekFrom::Start(0)).ok()?;
 
   if amount_read > 0
     && let Some(sniffed) = sniff_mime(&header[..amount_read as usize])
@@ -190,7 +210,7 @@ pub fn infer_from_fd(fd: &OwnedFd) -> Option<MimeType> {
 fn query_file_for_fd(fd: &OwnedFd) -> Option<MimeType> {
   let (read_fd, write_fd) = pipe_with(PipeFlags::CLOEXEC).ok()?;
 
-  let pid = unsafe { libc::fork() };
+  let pid = unsafe { fork() };
   if pid < 0 {
     return None;
   }
@@ -206,8 +226,8 @@ fn query_file_for_fd(fd: &OwnedFd) -> Option<MimeType> {
     // undo the inherited SIG_IGN. `file` shouldnt silently swallow a `SIGPIPE` from it's own stdout
     // pipe closing early.
     unsafe {
-      libc::signal(SIGHUP, SIG_DFL);
-      libc::signal(SIGPIPE, SIG_DFL);
+      signal(SIGHUP, SIG_DFL);
+      signal(SIGPIPE, SIG_DFL);
     }
 
     if let Ok(devnull) = open(c"/dev/null", OFlags::WRONLY, Mode::empty()) {
@@ -215,7 +235,7 @@ fn query_file_for_fd(fd: &OwnedFd) -> Option<MimeType> {
       drop(devnull);
     }
 
-    let argv: [*const libc::c_char; 5] = [
+    let argv: [*const c_char; 5] = [
       c"file".as_ptr(),
       // drop leading "-: "
       c"-b".as_ptr(),
@@ -226,9 +246,9 @@ fn query_file_for_fd(fd: &OwnedFd) -> Option<MimeType> {
     ];
 
     unsafe {
-      libc::execvp(argv[0], argv.as_ptr());
+      execvp(argv[0], argv.as_ptr());
       // only reached if execvp() fails
-      libc::_exit(1);
+      _exit(1);
     }
   }
 
@@ -237,8 +257,8 @@ fn query_file_for_fd(fd: &OwnedFd) -> Option<MimeType> {
 
   // this child needs an actual `waitpid` so its exit status can be checked below.
   let mut wstatus = 0;
-  unsafe { libc::waitpid(pid, &raw mut wstatus, 0) };
-  if !libc::WIFEXITED(wstatus) || libc::WEXITSTATUS(wstatus) != 0 {
+  unsafe { waitpid(pid, &raw mut wstatus, 0) };
+  if !wifexited(wstatus) || wexitstatus(wstatus) != 0 {
     return None;
   }
 

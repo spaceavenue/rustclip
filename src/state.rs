@@ -1,3 +1,5 @@
+use core::ffi::{c_char, c_int};
+
 use rustix::fd::OwnedFd;
 use rustix::fs::{Mode, OFlags, open};
 use rustix::io::read;
@@ -16,6 +18,14 @@ use crate::mime::{
   MAX_MIME_TYPES, MimeType, classify_offer_types, is_text_mime, mime_type_to_request,
 };
 
+unsafe extern "C" {
+  fn fork() -> c_int;
+  fn execvp(file: *const c_char, argv: *const *const c_char) -> c_int;
+  fn setenv(name: *const c_char, value: *const c_char, overwrite: c_int) -> c_int;
+  fn exit(status: c_int) -> !;
+  fn _exit(status: c_int) -> !;
+}
+
 // tracks registered object ids
 #[derive(Default)]
 pub struct Global {
@@ -29,7 +39,7 @@ pub enum Action {
   PrintAndExit,
   ListTypes,
   PipeToCommand {
-    argv: *const *mut libc::c_char,
+    argv: *const *mut c_char,
     argc: usize,
   },
 }
@@ -97,11 +107,10 @@ impl State {
     // offer id 0 means empty clipboard or that it was cleared.
     if offer_id == 0 {
       self.had_empty_selection = true;
-      if let Action::PipeToCommand { argv, argc } = &self.action {
-        if let Ok(devnull) = open(c"/dev/null", OFlags::RDONLY, Mode::empty()) {
+      if let Action::PipeToCommand { argv, argc } = &self.action
+        && let Ok(devnull) = open(c"/dev/null", OFlags::RDONLY, Mode::empty()) {
           run_with_stdin(devnull, *argv, *argc, c"nil".as_ptr(), core::ptr::null());
         }
-      }
       return;
     }
 
@@ -117,7 +126,7 @@ impl State {
         write_stdout(self.building_mimes[i].as_bytes());
         write_stdout(b"\n");
       }
-      unsafe { libc::exit(0) };
+      unsafe { exit(0) };
     }
 
     let mimes = &self.building_mimes[..self.building_mime_len];
@@ -160,7 +169,7 @@ impl State {
       if matches!(&self.action, Action::PipeToCommand { .. }) {
         return;
       }
-      unsafe { libc::exit(1) };
+      unsafe { exit(1) };
     };
 
     match fetch_offer(conn, offer_id, &selected_mime) {
@@ -172,7 +181,7 @@ impl State {
           if !self.no_newline && is_text_mime(selected_mime.as_str()) {
             write_stdout(b"\n");
           }
-          unsafe { libc::exit(0) };
+          unsafe { exit(0) };
         }
         Action::PipeToCommand { argv, argc } => {
           let state_cstr = if classified.has_sensitive_hint {
@@ -267,15 +276,15 @@ fn stream_fd_to_stdout(read_fd: OwnedFd) -> Result<(), AppError> {
 // `argv`.
 fn run_with_stdin(
   read_fd: OwnedFd,
-  argv: *const *mut libc::c_char,
+  argv: *const *mut c_char,
   argc: usize,
-  state: *const libc::c_char,
-  mime_type: *const libc::c_char,
+  state: *const c_char,
+  mime_type: *const c_char,
 ) {
   if argc == 0 {
     return;
   }
-  let pid = unsafe { libc::fork() };
+  let pid = unsafe { fork() };
   if pid < 0 {
     WireError::Sys(SysError::last("fork")).write_diagnostic();
     return;
@@ -284,17 +293,17 @@ fn run_with_stdin(
     let _ = dup2_stdin(read_fd);
     unsafe {
       if !state.is_null() {
-        libc::setenv(c"CLIPBOARD_STATE".as_ptr(), state, 1);
+        setenv(c"CLIPBOARD_STATE".as_ptr(), state, 1);
       }
       if !mime_type.is_null() {
-        libc::setenv(c"CLIPBOARD_TYPE".as_ptr(), mime_type, 1);
+        setenv(c"CLIPBOARD_TYPE".as_ptr(), mime_type, 1);
       }
       // `argv` came straight from `main`'s own argv, which the OS guarantees is NUL-terminated at
       // argv[argc]. so, a pointer offset into it is still validly NUL-terminated and this can be
       // handed to execvp directly without rebuilding it.
-      libc::execvp((*argv).cast_const(), argv.cast());
+      execvp((*argv).cast_const(), argv.cast());
       // only reached if exec itself failed
-      libc::_exit(1);
+      _exit(1);
     }
   }
 }

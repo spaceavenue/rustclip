@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+use core::ffi::{c_char, c_int};
+
 use rustclip::mime::MimeType;
 use rustclip::state::{Action, State};
 use wllib::cli;
@@ -11,12 +13,16 @@ use wllib::registry::crawl;
 use wllib::transport::Connection;
 use wllib::wire::Message;
 
+const SIGCHLD: c_int = 17;
+const SIG_IGN: usize = 1;
+
 #[link(name = "c", kind = "static")]
 unsafe extern "C" {}
 
 unsafe extern "C" {
-  static optarg: *const libc::c_char;
-  static mut optind: libc::c_int;
+  static optarg: *const c_char;
+  static mut optind: c_int;
+  fn signal(sig: c_int, handler: usize) -> usize;
 }
 
 const OPTSTRING: *const i8 = c"pt:".as_ptr();
@@ -29,7 +35,7 @@ const LONGOPTS: [cli::LongOption; 4] = [
 ];
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn main(argc: isize, argv: *const *mut libc::c_char) -> libc::c_int {
+pub unsafe extern "C" fn main(argc: isize, argv: *const *mut c_char) -> c_int {
   let mut use_primary = false;
   let mut wanted_mime: Option<MimeType> = None;
   let mut longindex = 0;
@@ -58,20 +64,20 @@ pub unsafe extern "C" fn main(argc: isize, argv: *const *mut libc::c_char) -> li
   }
 
   let optind_val = unsafe { optind };
-  if optind_val >= argc as libc::c_int {
+  if optind_val >= argc as c_int {
     write_stderr("Usage: wl-watch [-p|--use-primary] [-t|--type mime] <command> [args...]\n");
-    unsafe { libc::exit(1) };
+    return 1;
   }
   let command_argv = unsafe { argv.add(optind_val as usize) };
-  let command_argc = (argc as libc::c_int - optind_val) as usize;
+  let command_argc = (argc as c_int - optind_val) as usize;
 
-  unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
+  unsafe { signal(SIGCHLD, SIG_IGN) };
 
   let mut conn = match Connection::connect() {
     Ok(c) => c,
     Err(e) => {
       e.write_diagnostic();
-      unsafe { libc::exit(1) };
+      return 1;
     }
   };
   let action = Action::PipeToCommand {
@@ -82,16 +88,16 @@ pub unsafe extern "C" fn main(argc: isize, argv: *const *mut libc::c_char) -> li
 
   if let Err(e) = crawl(&mut conn, &mut state) {
     e.write_diagnostic();
-    unsafe { libc::exit(1) };
+    return 1;
   }
 
   if state.global.manager_id == 0 {
     write_stderr(b"[wl-watch]: compositor does not support wlr-data-control\n");
-    unsafe { libc::exit(1) };
+    return 1;
   }
   if state.global.seat_id == 0 {
     write_stderr(b"[wl-watch]: no wl_seat found\n");
-    unsafe { libc::exit(1) };
+    return 1;
   }
 
   let device_id = conn.alloc_id();
@@ -109,7 +115,7 @@ pub unsafe extern "C" fn main(argc: isize, argv: *const *mut libc::c_char) -> li
   loop {
     if let Err(e) = dispatch_once(&mut conn, &mut state) {
       e.write_diagnostic();
-      unsafe { libc::exit(1) }
+      return 1;
     }
   }
 }
