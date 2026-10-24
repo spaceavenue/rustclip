@@ -18,6 +18,14 @@
 // prioritize explicit requested types, then inferred types, then UTF-8 / plain text fallbacks —
 // matching wl-clipboard's behavior of the same name.
 
+use core::str;
+
+use libc::{SIG_DFL, SIGHUP, SIGPIPE};
+use rustix::fd::{AsFd, AsRawFd, OwnedFd};
+use rustix::fs::{CWD, Mode, OFlags, SeekFrom, open, readlinkat_raw, seek};
+use rustix::io::read;
+use rustix::pipe::{PipeFlags, pipe_with};
+use rustix::stdio;
 use wllib::fmt_lite::StringOnStack;
 
 pub const MAX_MIME_LEN: usize = 128;
@@ -54,7 +62,7 @@ pub fn is_text_mime(mime: &str) -> bool {
     || mime.ends_with("pgp-keys")
 }
 
-/// Infer common MIME types from the initial bytes (magic numbers) of the data.
+/// Infer common MIME types from the initial bytes of the data.
 #[must_use]
 pub fn sniff_mime(buf: &[u8]) -> Option<&'static str> {
   // PNG: \x89PNG\r\n\x1a\n
@@ -99,26 +107,16 @@ pub fn sniff_mime(buf: &[u8]) -> Option<&'static str> {
 
 /// Return the path of the file linked to a file descriptor.
 #[must_use]
-pub fn path_for_fd(fd: libc::c_int) -> Option<StringOnStack<256>> {
+pub fn path_for_fd<Fd: AsFd>(fd: Fd) -> Option<StringOnStack<256>> {
   let mut proc_path = StringOnStack::<64>::new();
-  proc_path.push_str("/proc/self/fd/").push_i32(fd);
+  proc_path.push_str("/proc/self/fd/").push_i32(fd.as_fd().as_raw_fd());
 
   let mut buf = [0u8; 256];
-  let n = unsafe {
-    libc::readlink(
-      proc_path.as_ptr(),
-      buf.as_mut_ptr().cast::<libc::c_char>(),
-      buf.len() - 1,
-    )
-  };
-  if n > 0 {
-    let mut res = StringOnStack::<256>::new();
-    if let Ok(s) = core::str::from_utf8(&buf[..n as usize]) {
-      res.push_str(s);
-      return Some(res);
-    }
-  }
-  None
+  let n = readlinkat_raw(CWD, proc_path.as_c_str(), &mut buf).ok()?;
+  let s = str::from_utf8(&buf[..n]).ok()?;
+  let mut res = StringOnStack::<256>::new();
+  res.push_str(s);
+  Some(res)
 }
 
 /// Common filename extension -> MIME type mappings, covering the formats most likely to show up
@@ -172,116 +170,92 @@ pub fn infer_from_name(file_path: &str) -> Option<MimeType> {
     .map(|(_, mime)| MimeType::from(*mime))
 }
 
-/// Infer a MIME type for an open fd's content: magic-byte sniffing first (cheap, in-process, no
-/// fork), then `file --mime-type -` fed the content directly over stdin as a fallback for
-/// whatever content sniffing doesn't recognize.
+/// Infer a MIME type for an open fd's content.
 #[must_use]
-pub fn infer_from_fd(fd: libc::c_int) -> Option<MimeType> {
+pub fn infer_from_fd(fd: &OwnedFd) -> Option<MimeType> {
   let mut header = [0u8; 64];
-  unsafe { libc::lseek(fd, 0, libc::SEEK_SET) };
-  let n = unsafe { libc::read(fd, header.as_mut_ptr().cast(), header.len()) };
-  unsafe { libc::lseek(fd, 0, libc::SEEK_SET) };
-  if n > 0
-    && let Some(sniffed) = sniff_mime(&header[..n as usize])
+
+  seek(&fd, SeekFrom::Start(0)).ok()?;
+  let amount_read = read(&fd, &mut header).ok()?;
+  seek(&fd, SeekFrom::Start(0)).ok()?;
+
+  if amount_read > 0
+    && let Some(sniffed) = sniff_mime(&header[..amount_read as usize])
   {
     return Some(MimeType::from(sniffed));
   }
   query_file_for_fd(fd)
 }
 
-/// Fork+exec `file --mime-type -`, feeding it `fd`'s content over its stdin and reading the
-/// mime type back over a pipe on its stdout. `fd` is expected to be rewound to the start.
-fn query_file_for_fd(fd: libc::c_int) -> Option<MimeType> {
-  // this pipe carries `file`'s stdout (the mime type string) back to us.
-  let mut pipe_fds = [0i32; 2];
-  if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-    return None;
-  }
+fn query_file_for_fd(fd: &OwnedFd) -> Option<MimeType> {
+  let (read_fd, write_fd) = pipe_with(PipeFlags::CLOEXEC).ok()?;
 
   let pid = unsafe { libc::fork() };
   if pid < 0 {
-    unsafe {
-      libc::close(pipe_fds[0]);
-      libc::close(pipe_fds[1]);
-    }
     return None;
   }
 
   if pid == 0 {
+    // close child's read end of the pipe.
+    drop(read_fd);
+    // route fd to stdin, write end to stdout of child process, then close child's write end.
+    let _ = stdio::dup2_stdin(fd);
+    let _ = stdio::dup2_stdout(&write_fd);
+    drop(write_fd);
+
+    // undo the inherited SIG_IGN. `file` shouldnt silently swallow a `SIGPIPE` from it's own stdout
+    // pipe closing early.
     unsafe {
-      // close child's read end of the pipe.
-      libc::close(pipe_fds[0]);
-      // route fd to stdin, write end to stdout of child process, then close child's write end.
-      libc::dup2(fd, 0);
-      libc::dup2(pipe_fds[1], 1);
-      libc::close(pipe_fds[1]);
-      // undo the fork-inherited SIG_IGN the parent may have set for these.`file` should see default
-      // signal disposition, not silently swallow a `SIGPIPE` from its own stdout pipe closing
-      // early.
-      libc::signal(libc::SIGHUP, libc::SIG_DFL);
-      libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+      libc::signal(SIGHUP, SIG_DFL);
+      libc::signal(SIGPIPE, SIG_DFL);
+    }
 
-      // pipe stderr to /dev/nill.
-      let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
-      if devnull >= 0 {
-        libc::dup2(devnull, 2);
-        libc::close(devnull);
-      }
+    if let Ok(devnull) = open(c"/dev/null", OFlags::WRONLY, Mode::empty()) {
+      let _ = stdio::dup2_stderr(&devnull);
+      drop(devnull);
+    }
 
-      let argv: [*const libc::c_char; 5] = [
-        c"file".as_ptr(),
-        // drop leading "-: "
-        c"-b".as_ptr(),
-        // print type/subtype. -i/--mine print '; charset=...' as well. see shape check below for
-        // why this matters.
-        c"--mime-type".as_ptr(),
-        c"-".as_ptr(),
-        core::ptr::null(),
-      ];
+    let argv: [*const libc::c_char; 5] = [
+      c"file".as_ptr(),
+      // drop leading "-: "
+      c"-b".as_ptr(),
+      // print type/subtype. -i/--mine print '; charset=...' as well
+      c"--mime-type".as_ptr(),
+      c"-".as_ptr(),
+      core::ptr::null(),
+    ];
+
+    unsafe {
       libc::execvp(argv[0], argv.as_ptr());
-      // only reached if execvp() fails. let waitpid below handle it.
+      // only reached if execvp() fails
       libc::_exit(1);
     }
   }
 
   // close parent's write end of the pipe so that the EOF arrives to the read end below.
-  unsafe { libc::close(pipe_fds[1]) };
+  drop(write_fd);
 
-  // this specific child needs an actual `waitpid` so its exit status can be checked below.
+  // this child needs an actual `waitpid` so its exit status can be checked below.
   let mut wstatus = 0;
   unsafe { libc::waitpid(pid, &raw mut wstatus, 0) };
   if !libc::WIFEXITED(wstatus) || libc::WEXITSTATUS(wstatus) != 0 {
-    unsafe { libc::close(pipe_fds[0]) };
     return None;
   }
 
   let mut buf = [0u8; 256];
-  let n = unsafe {
-    libc::read(
-      pipe_fds[0],
-      buf.as_mut_ptr().cast::<libc::c_void>(),
-      buf.len(),
-    )
-  };
-  unsafe { libc::close(pipe_fds[0]) };
-
-  if n <= 0 {
-    return None;
-  }
+  let n = read(read_fd, &mut buf).ok()?;
 
   let slice = &buf[..n as usize];
-  let trimmed = match core::str::from_utf8(slice) {
+  let trimmed = match str::from_utf8(slice) {
     Ok(s) => s.trim_ascii(),
-    Err(e) => match core::str::from_utf8(&slice[..e.valid_up_to()]) {
+    Err(e) => match str::from_utf8(&slice[..e.valid_up_to()]) {
       Ok(s) => s.trim_ascii(),
       Err(_) => return None,
     },
   };
 
-  // `file` sometimes prints a failure message to stdout instead of stderr (e.g. `file` printing
-  // "cannot open `...' (No such file or directory)" with exit status 0. a real mime type is exactly
-  // `type/subtype` with no whitespace and non-empty halves, so require that shape instead of
-  // trusting exit status alone.
+  // annoyingly, `file` prints failure messages to stdout instead of stderr with exit status 0. a
+  // mime type is exactly `type/subtype`, so require that format instead of trusting exit status
   let looks_like_mime = !trimmed.contains(char::is_whitespace)
     && match trimmed.split_once('/') {
       Some((ty, subty)) => !ty.is_empty() && !subty.is_empty() && !subty.contains('/'),

@@ -8,6 +8,7 @@ description = "A wl-clipboard like utility."
 
 [dependencies]
 libc = { version = "0.2.186", default-features = false }
+rustix = { version = "1.1.5", default-features = false, features = ["fs", "mm", "pipe", "process", "stdio"] }
 wllib = { git = "https://github.com/spaceavenue/wllib.git" }
 
 [[bin]]

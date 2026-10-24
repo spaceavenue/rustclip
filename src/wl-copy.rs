@@ -9,9 +9,13 @@
 
 use rustclip::error::AppError;
 use rustclip::mime::{self, GENERIC_TEXT_OFFERS, MimeType};
+use rustix::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use rustix::fs::{MemfdFlags, SeekFrom, ftruncate, memfd_create, seek};
+use rustix::io::read;
+use rustix::stdio::stdin;
 use wllib::cli;
 use wllib::dispatch::EventHandler;
-use wllib::error::{SysError, WireError};
+use wllib::error::{SysError, SysResultExt, WireError};
 use wllib::fmt_lite::StringOnStack;
 use wllib::io::{write_fd, write_stderr};
 use wllib::protocols::{
@@ -117,38 +121,42 @@ pub unsafe extern "C" fn main(argc: isize, argv: *const *mut libc::c_char) -> li
 
   // Create an anonymous file descriptor in RAM to hold the clipboard data
   let optind_val = unsafe { optind };
-  let memfd = unsafe { libc::memfd_create(c"wl-clip".as_ptr(), libc::MFD_CLOEXEC) };
-  if memfd < 0 {
-    AppError::Sys(SysError::last("memfd_create")).write_diagnostic();
-    unsafe { libc::exit(1) };
-  }
+  let memfd = match memfd_create(c"wl-clip", MemfdFlags::CLOEXEC) {
+    Ok(mfd) => mfd,
+    Err(e) => {
+      AppError::Sys(SysError::from_errno("memfd_create", e)).write_diagnostic();
+      return 1;
+    }
+  };
+
   let is_stdin = optind_val >= argc as libc::c_int;
   if is_stdin {
-    if let Err(e) = write_stdin_to_fd(memfd) {
+    if let Err(e) = write_stdin_to_fd(&memfd) {
       e.write_diagnostic();
-      unsafe { libc::exit(1) };
+      return 1;
     }
-  } else if let Err(e) = write_args_to_fd(memfd, argv, optind_val as usize, argc.cast_unsigned()) {
+  } else if let Err(e) = write_args_to_fd(&memfd, argv, optind_val as usize, argc.cast_unsigned()) {
     e.write_diagnostic();
-    unsafe { libc::exit(1) };
+    return 1;
   }
 
-  trim_newline.then(|| trim_trailing_newline(memfd));
+  if trim_newline {
+    trim_trailing_newline(&memfd);
+  }
 
-  // only stdin content is inferred from — an explicit argument list is already text the user
+  // only stdin content is inferred from. an explicit argument list is already text the user
   // typed on the command line, and `-t` always takes priority over either.
   let inferred_mime = if is_stdin && wanted_mime.is_none() {
-    mime::infer_from_fd(memfd)
+    mime::infer_from_fd(&memfd)
   } else {
     None
   };
-  let fd_to_copy = memfd;
 
   let mut conn = match Connection::connect() {
     Ok(c) => c,
     Err(e) => {
       e.write_diagnostic();
-      unsafe { libc::exit(1) };
+      return 1;
     }
   };
 
@@ -157,16 +165,16 @@ pub unsafe extern "C" fn main(argc: isize, argv: *const *mut libc::c_char) -> li
   };
   if let Err(e) = crawl(&mut conn, &mut state) {
     e.write_diagnostic();
-    unsafe { libc::exit(1) };
+    return 1;
   }
 
   if state.global.manager_id == 0 {
     write_stderr("[wl-copy]: compositor does not support wlr-data-control\n");
-    unsafe { libc::exit(1) };
+    return 1;
   }
   if state.global.seat_id == 0 {
     write_stderr("[wl-copy]: no wl_seat found\n");
-    unsafe { libc::exit(1) };
+    return 1;
   }
   let manager_id = state.global.manager_id;
   let seat_id = state.global.seat_id;
@@ -223,9 +231,9 @@ pub unsafe extern "C" fn main(argc: isize, argv: *const *mut libc::c_char) -> li
     let pid = unsafe { libc::fork() };
     if pid < 0 {
       write_stderr("[wl-copy]: failed to fork process\n");
-      unsafe { libc::exit(1) };
+      return 1;
     } else if pid > 0 {
-      unsafe { libc::exit(0) };
+      return 0;
     }
   }
 
@@ -233,7 +241,7 @@ pub unsafe extern "C" fn main(argc: isize, argv: *const *mut libc::c_char) -> li
   // selection (or with -o, until we've served exactly one request).
   loop {
     let mut buf = [0u8; 4096];
-    let (result, fd) = conn.recv_with_fd(&mut buf);
+    let (result, mut fd) = conn.recv_with_fd(&mut buf);
     let data = match result {
       Ok(items) => items,
       Err(WireError::ConnectionClosed) => break,
@@ -243,85 +251,83 @@ pub unsafe extern "C" fn main(argc: isize, argv: *const *mut libc::c_char) -> li
       }
     };
 
-    let mut pending_fd = fd;
     let mut idx = 0;
     while let Some(header) = parse_header(data, idx) {
       if header.sender == source_id {
         match header.opcode {
           zwlr_data_control_source_v1::event::SEND => {
-            if let Some(target_fd) = pending_fd.take() {
-              let _ = write_content_to_fd(fd_to_copy, target_fd, true);
+            if let Some(target_fd) = fd.take() {
+              let _ = write_content_to_fd(memfd.as_fd(), &target_fd, true);
               if paste_once {
-                unsafe { libc::exit(0) };
+                return 0;
               }
             } else {
               write_stderr("[wl-copy]: got a send event with no accompanying fd, ignoring\n");
             }
           }
           zwlr_data_control_source_v1::event::CANCELLED => {
-            unsafe { libc::exit(0) };
+            return 0;
           }
           _ => (),
         }
       }
       idx += header.size as usize;
     }
-    // prevent leaking an fd that arrived but wasn't claimed by any SEND event.
-    if let Some(unclaimed_fd) = pending_fd {
-      unsafe { libc::close(unclaimed_fd) };
-    }
   }
-  unsafe { libc::close(fd_to_copy) };
   0
 }
 
 /// trims a single trailing '\n' in the given fd.
-fn trim_trailing_newline(fd: libc::c_int) {
-  let size = unsafe { libc::lseek(fd, 0, libc::SEEK_END) };
+fn trim_trailing_newline(fd: &OwnedFd) {
+  let Ok(size) = seek(fd, SeekFrom::End(0)).syserr("seek") else {
+    return;
+  };
+  let mut last_byte = [0u8; 1];
   if size > 0 {
-    let mut last_byte = [0u8; 1];
-    unsafe { libc::lseek(fd, size - 1, libc::SEEK_SET) };
-    if unsafe { libc::read(fd, last_byte.as_mut_ptr().cast(), 1) == 1 } && last_byte[0] == b'\n' {
-      unsafe { libc::ftruncate(fd, size - 1) };
-    }
+    let _ = seek(&fd, SeekFrom::Start(size - 1));
   }
+  if let Ok(1) = read(&fd, &mut last_byte)
+    && last_byte[0] == b'\n'
+  {
+    let Ok(_) = ftruncate(fd, size - 1) else {
+      return;
+    };
+  };
 }
 
 /// writes data from `source_fd` to `target_fd`
 fn write_content_to_fd(
-  source_fd: libc::c_int,
-  target_fd: libc::c_int,
-  close: bool,
+  source_fd: BorrowedFd,
+  target_fd: &OwnedFd,
+  _close: bool,
 ) -> Result<(), AppError> {
   // if not stdin, reset the file offset of the fd to the beginning before copying.
-  if source_fd != 0 {
-    unsafe { libc::lseek(source_fd, 0, libc::SEEK_SET) };
+  if source_fd.as_raw_fd() != 0 {
+    seek(source_fd, SeekFrom::Start(0)).syserr("seek")?;
   }
   let mut chunk = [0u8; 4096];
   loop {
-    let n = unsafe { libc::read(source_fd, chunk.as_mut_ptr().cast(), chunk.len()) };
-    match n {
-      n if n > 0 => {
-        write_fd(target_fd, &chunk[..n as usize], None).map_err(AppError::Sys)?;
-      }
-      0 => break,
-      _ => return Err(AppError::Sys(SysError::last("read"))),
+    let n = read(source_fd, &mut chunk).syserr("read")?;
+    if n == 0 {
+      break;
     }
+    write_fd(target_fd, &chunk[..n], None).map_err(AppError::Sys)?;
   }
-  if close {
-    unsafe { libc::close(target_fd) };
-  }
+  // if close {
+  //   unsafe { libc::close(target_fd) };
+  // }
   Ok(())
 }
 
 /// writes whatever was received from stdin to the given fd
-fn write_stdin_to_fd(fd: libc::c_int) -> Result<(), AppError> {
-  write_content_to_fd(0, fd, false)
+fn write_stdin_to_fd(fd: &OwnedFd) -> Result<(), AppError> {
+  let stdin = unsafe { stdin() };
+  write_content_to_fd(stdin, fd, false)
 }
 
 /// writes argv to the given fd
 fn write_args_to_fd(
-  fd: libc::c_int,
+  fd: &OwnedFd,
   argv: *const *mut libc::c_char,
   start: usize,
   argc: usize,

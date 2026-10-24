@@ -3,6 +3,7 @@
 
 use rustclip::mime::{self, MimeType};
 use rustclip::state::{Action, State};
+use rustix::stdio;
 use wllib::cli;
 use wllib::dispatch::dispatch_once;
 use wllib::io::write_stderr;
@@ -64,7 +65,7 @@ pub unsafe extern "C" fn main(argc: isize, argv: *const *mut libc::c_char) -> li
   }
 
   let inferred_mime = if wanted_mime.is_none() {
-    if let Some(stdout_path) = mime::path_for_fd(1) {
+    if let Some(stdout_path) = mime::path_for_fd(unsafe { stdio::stdout() }) {
       mime::infer_from_name(stdout_path.as_str())
     } else {
       None

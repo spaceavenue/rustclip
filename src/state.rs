@@ -1,5 +1,10 @@
+use rustix::fd::OwnedFd;
+use rustix::fs::{Mode, OFlags, open};
+use rustix::io::read;
+use rustix::pipe::{PipeFlags, pipe_with};
+use rustix::stdio::{dup2_stdin, stdout};
 use wllib::dispatch::EventHandler;
-use wllib::error::{SysError, WireError};
+use wllib::error::{SysError, SysResultExt, WireError};
 use wllib::io::write_stdout;
 use wllib::protocols::{zwlr_data_control_device_v1, zwlr_data_control_offer_v1};
 use wllib::registry::{GlobalHandler, bind, clamp_version};
@@ -93,11 +98,8 @@ impl State {
     if offer_id == 0 {
       self.had_empty_selection = true;
       if let Action::PipeToCommand { argv, argc } = &self.action {
-        let devnull =
-          unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-        if devnull >= 0 {
+        if let Ok(devnull) = open(c"/dev/null", OFlags::RDONLY, Mode::empty()) {
           run_with_stdin(devnull, *argv, *argc, c"nil".as_ptr(), core::ptr::null());
-          unsafe { libc::close(devnull) };
         }
       }
       return;
@@ -170,7 +172,6 @@ impl State {
           if !self.no_newline && is_text_mime(selected_mime.as_str()) {
             write_stdout(b"\n");
           }
-          unsafe { libc::close(read_fd) };
           unsafe { libc::exit(0) };
         }
         Action::PipeToCommand { argv, argc } => {
@@ -181,7 +182,6 @@ impl State {
           };
           let type_cstr = selected_mime.as_ptr();
           run_with_stdin(read_fd, *argv, *argc, state_cstr, type_cstr);
-          unsafe { libc::close(read_fd) };
         }
         Action::ListTypes => unreachable!(),
       },
@@ -236,22 +236,12 @@ impl EventHandler for State {
 // held by whichever process is providing the data) still needs to close its own copy too before the
 // reader sees EOF, but if we kept ours open as well, EOF would never arrive at all even after the
 // real writer finishes.
-fn fetch_offer(
-  conn: &mut Connection,
-  offer_id: u32,
-  mime: &MimeType,
-) -> Result<libc::c_int, AppError> {
-  let mut pipe_fds = [0i32; 2];
-  if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-    return Err(AppError::Sys(SysError::last("pipe2")));
-  }
-  let [read_fd, write_fd] = pipe_fds;
+fn fetch_offer(conn: &mut Connection, offer_id: u32, mime: &MimeType) -> Result<OwnedFd, AppError> {
+  let (read_fd, write_fd) = pipe_with(PipeFlags::CLOEXEC).syserr("pipe")?;
 
   let mut msg = Message::new(offer_id, zwlr_data_control_offer_v1::request::RECEIVE);
   msg.write_str(mime.as_str());
-  conn.send_logged(&msg, Some(write_fd));
-
-  unsafe { libc::close(write_fd) };
+  conn.send_logged(&msg, Some(&write_fd));
 
   Ok(read_fd)
 }
@@ -259,25 +249,24 @@ fn fetch_offer(
 // stream `read_fd` to stdout until EOF in fixed-size chunks. clipboard content isn't assumed to
 // fit in memory all at once. distinguishes a genuine read/write failure from clean EOF so the
 // caller can report it.
-fn stream_fd_to_stdout(read_fd: libc::c_int) -> Result<(), AppError> {
+fn stream_fd_to_stdout(read_fd: OwnedFd) -> Result<(), AppError> {
   let mut buf = [0u8; 8192];
   loop {
-    let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len()) };
-    match n {
-      0 => break,
-      n if n > 0 => {
-        wllib::io::write_fd(1, &buf[..n as usize], None).map_err(AppError::Sys)?;
-      }
-      _ => return Err(AppError::Sys(SysError::last("read"))),
+    let n = read(&read_fd, &mut buf).syserr("read")?;
+    if n == 0 {
+      break;
     }
+    let stdout = unsafe { stdout() };
+    wllib::io::write_fd(stdout, &buf[..n as usize], None).map_err(AppError::Sys)?;
   }
+
   Ok(())
 }
 
 // fork, wire `read_fd` up as the child's stdin, set CLIPBOARD_STATE and CLIPBOARD_TYPE, and exec
 // `argv`.
 fn run_with_stdin(
-  read_fd: libc::c_int,
+  read_fd: OwnedFd,
   argv: *const *mut libc::c_char,
   argc: usize,
   state: *const libc::c_char,
@@ -286,16 +275,14 @@ fn run_with_stdin(
   if argc == 0 {
     return;
   }
-  unsafe {
-    let pid = libc::fork();
-    if pid < 0 {
-      WireError::Sys(SysError::last("fork")).write_diagnostic();
-      return;
-    }
-    if pid == 0 {
-      libc::dup2(read_fd, 0);
-      // parent's copy of read_fd is no longer needed once the child has its own via dup2.
-      libc::close(read_fd);
+  let pid = unsafe { libc::fork() };
+  if pid < 0 {
+    WireError::Sys(SysError::last("fork")).write_diagnostic();
+    return;
+  }
+  if pid == 0 {
+    let _ = dup2_stdin(read_fd);
+    unsafe {
       if !state.is_null() {
         libc::setenv(c"CLIPBOARD_STATE".as_ptr(), state, 1);
       }
