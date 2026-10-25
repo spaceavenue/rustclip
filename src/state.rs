@@ -14,6 +14,7 @@ use wllib::transport::Connection;
 use wllib::wire::{Message, read_str, read_u32};
 
 use crate::error::AppError;
+use crate::exit;
 use crate::mime::{
   MAX_MIME_TYPES, MimeType, classify_offer_types, is_text_mime, mime_type_to_request,
 };
@@ -22,8 +23,6 @@ unsafe extern "C" {
   fn fork() -> c_int;
   fn execvp(file: *const c_char, argv: *const *const c_char) -> c_int;
   fn setenv(name: *const c_char, value: *const c_char, overwrite: c_int) -> c_int;
-  fn exit(status: c_int) -> !;
-  fn _exit(status: c_int) -> !;
 }
 
 // tracks registered object ids
@@ -61,6 +60,7 @@ pub struct State {
   building_mimes: [MimeType; MAX_MIME_TYPES],
   building_mime_len: usize,
 }
+
 impl State {
   #[must_use]
   pub fn init(
@@ -108,9 +108,10 @@ impl State {
     if offer_id == 0 {
       self.had_empty_selection = true;
       if let Action::PipeToCommand { argv, argc } = &self.action
-        && let Ok(devnull) = open(c"/dev/null", OFlags::RDONLY, Mode::empty()) {
-          run_with_stdin(devnull, *argv, *argc, c"nil".as_ptr(), core::ptr::null());
-        }
+        && let Ok(devnull) = open(c"/dev/null", OFlags::RDONLY, Mode::empty())
+      {
+        run_with_stdin(devnull, *argv, *argc, c"nil".as_ptr(), core::ptr::null());
+      }
       return;
     }
 
@@ -126,7 +127,7 @@ impl State {
         write_stdout(self.building_mimes[i].as_bytes());
         write_stdout(b"\n");
       }
-      unsafe { exit(0) };
+      exit::exit(0);
     }
 
     let mimes = &self.building_mimes[..self.building_mime_len];
@@ -169,7 +170,7 @@ impl State {
       if matches!(&self.action, Action::PipeToCommand { .. }) {
         return;
       }
-      unsafe { exit(1) };
+      exit::exit(1);
     };
 
     match fetch_offer(conn, offer_id, &selected_mime) {
@@ -181,7 +182,7 @@ impl State {
           if !self.no_newline && is_text_mime(selected_mime.as_str()) {
             write_stdout(b"\n");
           }
-          unsafe { exit(0) };
+          exit::exit(0);
         }
         Action::PipeToCommand { argv, argc } => {
           let state_cstr = if classified.has_sensitive_hint {
@@ -302,8 +303,8 @@ fn run_with_stdin(
       // argv[argc]. so, a pointer offset into it is still validly NUL-terminated and this can be
       // handed to execvp directly without rebuilding it.
       execvp((*argv).cast_const(), argv.cast());
-      // only reached if exec itself failed
-      _exit(1);
     }
+    // only reached if exec itself failed
+    exit::exit(1);
   }
 }

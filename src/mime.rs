@@ -25,27 +25,16 @@ use rustix::fd::{AsFd, AsRawFd, OwnedFd};
 use rustix::fs::{CWD, Mode, OFlags, SeekFrom, open, readlinkat_raw, seek};
 use rustix::io::read;
 use rustix::pipe::{PipeFlags, pipe_with};
+use rustix::process::{Pid, WaitOptions, waitpid};
 use rustix::stdio;
 use wllib::fmt_lite::StringOnStack;
 
-const SIGHUP: c_int = 1;
-const SIGPIPE: c_int = 13;
-const SIG_DFL: usize = 0;
-
-const fn wifexited(status: c_int) -> bool {
-  (status & 0x7f) == 0
-}
-
-const fn wexitstatus(status: c_int) -> c_int {
-  (status >> 8) & 0xff
-}
+use crate::exit;
+use crate::signal::{SIG_DFL, SIGHUP, SIGPIPE, signal};
 
 unsafe extern "C" {
   fn fork() -> c_int;
   fn execvp(file: *const c_char, argv: *const *const c_char) -> c_int;
-  fn _exit(status: c_int) -> !;
-  fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
-  fn signal(signum: c_int, handler: usize) -> usize;
 }
 
 pub const MAX_MIME_LEN: usize = 128;
@@ -129,7 +118,9 @@ pub fn sniff_mime(buf: &[u8]) -> Option<&'static str> {
 #[must_use]
 pub fn path_for_fd<Fd: AsFd>(fd: Fd) -> Option<StringOnStack<256>> {
   let mut proc_path = StringOnStack::<64>::new();
-  proc_path.push_str("/proc/self/fd/").push_i32(fd.as_fd().as_raw_fd());
+  proc_path
+    .push_str("/proc/self/fd/")
+    .push_i32(fd.as_fd().as_raw_fd());
 
   let mut buf = [0u8; 256];
   let n = readlinkat_raw(CWD, proc_path.as_c_str(), &mut buf).ok()?;
@@ -247,18 +238,17 @@ fn query_file_for_fd(fd: &OwnedFd) -> Option<MimeType> {
 
     unsafe {
       execvp(argv[0], argv.as_ptr());
-      // only reached if execvp() fails
-      _exit(1);
     }
+    // only reached if execvp() fails
+    exit::exit(1);
   }
 
   // close parent's write end of the pipe so that the EOF arrives to the read end below.
   drop(write_fd);
 
   // this child needs an actual `waitpid` so its exit status can be checked below.
-  let mut wstatus = 0;
-  unsafe { waitpid(pid, &raw mut wstatus, 0) };
-  if !wifexited(wstatus) || wexitstatus(wstatus) != 0 {
+  let (_, status) = waitpid(Pid::from_raw(pid), WaitOptions::empty()).ok()??;
+  if status.exit_status() != Some(0) {
     return None;
   }
 

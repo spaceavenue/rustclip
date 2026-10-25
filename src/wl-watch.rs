@@ -1,11 +1,13 @@
 #![no_std]
 #![no_main]
+#![allow(clippy::result_large_err)]
 
 use core::ffi::{c_char, c_int};
 
+use rustclip::cli::{Arg, ArgParser, get_args_iter};
 use rustclip::mime::MimeType;
 use rustclip::state::{Action, State};
-use wllib::cli;
+use rustclip::syscall::signal::{SIG_IGN, SIGCHLD, signal};
 use wllib::dispatch::dispatch_once;
 use wllib::io::write_stderr;
 use wllib::protocols::zwlr_data_control_manager_v1;
@@ -13,63 +15,49 @@ use wllib::registry::crawl;
 use wllib::transport::Connection;
 use wllib::wire::Message;
 
-const SIGCHLD: c_int = 17;
-const SIG_IGN: usize = 1;
-
 #[link(name = "c", kind = "static")]
 unsafe extern "C" {}
-
-unsafe extern "C" {
-  static optarg: *const c_char;
-  static mut optind: c_int;
-  fn signal(sig: c_int, handler: usize) -> usize;
-}
-
-const OPTSTRING: *const i8 = c"pt:".as_ptr();
-
-const LONGOPTS: [cli::LongOption; 4] = [
-  cli::LongOption::new(c"use-primary", cli::NO_ARGUMENT, 'p'),
-  cli::LongOption::new(c"primary", cli::NO_ARGUMENT, 'p'),
-  cli::LongOption::new(c"type", cli::REQUIRED_ARGUMENT, 't'),
-  cli::LONG_OPTION_TERMINATOR,
-];
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn main(argc: isize, argv: *const *mut c_char) -> c_int {
   let mut use_primary = false;
   let mut wanted_mime: Option<MimeType> = None;
-  let mut longindex = 0;
-  unsafe { optind = 1 };
+  let mut cmd_idx = None;
 
-  loop {
-    let c = unsafe {
-      cli::getopt_long(
-        argc as _,
-        argv,
-        OPTSTRING,
-        LONGOPTS.as_ptr(),
-        &raw mut longindex,
-      )
-    };
-    if c == -1 {
-      break;
-    }
-    match c as u8 as char {
-      'p' => use_primary = true,
-      't' if !unsafe { optarg.is_null() } => {
-        wanted_mime = Some(MimeType::from(unsafe { core::ffi::CStr::from_ptr(optarg) }));
+  if argc <= 1 || argv.is_null() {
+    write_stderr("Usage: wl-watch [-p|--use-primary] [-t|--type mime] <command> [args...]\n");
+    return 1;
+  }
+
+  let args_iter = unsafe { get_args_iter(argc as usize, argv) };
+  let mut parser = ArgParser::new(args_iter);
+  while let Some(arg) = parser.next_arg() {
+    match arg {
+      Arg::Short('p') | Arg::Long("use-primary") | Arg::Long("primary") => {
+        use_primary = true;
+      }
+      Arg::Short('t') | Arg::Long("type") => {
+        wanted_mime = parser.next_val().map(MimeType::from);
+      }
+      Arg::Value(val) => {
+        for i in 1..argc as usize {
+          if unsafe { *argv.add(i) } as *const u8 == val.as_ptr() {
+            cmd_idx = Some(i);
+            break;
+          }
+        }
+        break;
       }
       _ => (),
     }
   }
 
-  let optind_val = unsafe { optind };
-  if optind_val >= argc as c_int {
+  let Some(cmd_idx) = cmd_idx else {
     write_stderr("Usage: wl-watch [-p|--use-primary] [-t|--type mime] <command> [args...]\n");
     return 1;
-  }
-  let command_argv = unsafe { argv.add(optind_val as usize) };
-  let command_argc = (argc as c_int - optind_val) as usize;
+  };
+  let command_argv = unsafe { argv.add(cmd_idx) };
+  let command_argc = argc as usize - cmd_idx;
 
   unsafe { signal(SIGCHLD, SIG_IGN) };
 

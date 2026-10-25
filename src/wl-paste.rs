@@ -1,12 +1,13 @@
 #![no_std]
 #![no_main]
+#![allow(clippy::result_large_err)]
 
 use core::ffi::{c_char, c_int};
 
+use rustclip::cli::{Arg, ArgParser, get_args_iter};
 use rustclip::mime::{self, MimeType};
 use rustclip::state::{Action, State};
 use rustix::stdio;
-use wllib::cli;
 use wllib::dispatch::dispatch_once;
 use wllib::io::write_stderr;
 use wllib::protocols::zwlr_data_control_manager_v1;
@@ -17,50 +18,22 @@ use wllib::wire::Message;
 #[link(name = "c", kind = "static")]
 unsafe extern "C" {}
 
-unsafe extern "C" {
-  static optarg: *const c_char;
-  static mut optind: c_int;
-}
-
-const OPTSTRING: *const i8 = c"plnt:".as_ptr();
-
-const LONGOPTS: [cli::LongOption; 6] = [
-  cli::LongOption::new(c"use-primary", cli::NO_ARGUMENT, 'p'),
-  cli::LongOption::new(c"primary", cli::NO_ARGUMENT, 'p'),
-  cli::LongOption::new(c"list-types", cli::NO_ARGUMENT, 'l'),
-  cli::LongOption::new(c"no-newline", cli::NO_ARGUMENT, 'n'),
-  cli::LongOption::new(c"type", cli::REQUIRED_ARGUMENT, 't'),
-  cli::LONG_OPTION_TERMINATOR,
-];
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn main(argc: isize, argv: *const *mut c_char) -> c_int {
   let mut use_primary = false;
   let mut list_types = false;
   let mut no_newline = false;
   let mut wanted_mime: Option<MimeType> = None;
-  let mut longindex = 0;
-  unsafe { optind = 1 };
 
-  loop {
-    let c = unsafe {
-      cli::getopt_long(
-        argc as _,
-        argv,
-        OPTSTRING,
-        LONGOPTS.as_ptr(),
-        &raw mut longindex,
-      )
-    };
-    if c == -1 {
-      break;
-    }
-    match c as u8 as char {
-      'p' => use_primary = true,
-      'l' => list_types = true,
-      'n' => no_newline = true,
-      't' if !unsafe { optarg.is_null() } => {
-        wanted_mime = Some(MimeType::from(unsafe { core::ffi::CStr::from_ptr(optarg) }));
+  let args_iter = unsafe { get_args_iter(if argc < 0 { 0 } else { argc as usize }, argv) };
+  let mut parser = ArgParser::new(args_iter);
+  while let Some(arg) = parser.next_arg() {
+    match arg {
+      Arg::Short('p') | Arg::Long("use-primary") | Arg::Long("primary") => use_primary = true,
+      Arg::Short('l') | Arg::Long("list-types") => list_types = true,
+      Arg::Short('n') | Arg::Long("no-newline") => no_newline = true,
+      Arg::Short('t') | Arg::Long("type") => {
+        wanted_mime = parser.next_val().map(MimeType::from);
       }
       _ => (),
     }

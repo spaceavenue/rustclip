@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![allow(clippy::result_large_err)]
 
 // `wl-copy` doesn't use `wllib::dispatch`/`EventHandler` for its runtime loop, because
 // `zwlr_data_control_source_v1::send` hands this process a file descriptor as ancillary data which
@@ -9,13 +10,13 @@
 
 use core::ffi::{c_char, c_int};
 
+use rustclip::cli::{Arg, ArgParser, get_args_iter};
 use rustclip::error::AppError;
-use rustclip::mime::{self, GENERIC_TEXT_OFFERS, MimeType};
+use rustclip::mime::{self, GENERIC_TEXT_OFFERS, MimeType, infer_from_fd};
 use rustix::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use rustix::fs::{MemfdFlags, SeekFrom, ftruncate, memfd_create, seek};
 use rustix::io::read;
 use rustix::stdio::stdin;
-use wllib::cli;
 use wllib::dispatch::EventHandler;
 use wllib::error::{SysError, SysResultExt, WireError};
 use wllib::fmt_lite::StringOnStack;
@@ -71,21 +72,8 @@ impl EventHandler for State {
 unsafe extern "C" {}
 
 unsafe extern "C" {
-  static optarg: *const c_char;
-  static mut optind: c_int;
   fn fork() -> c_int;
 }
-
-const OPTSTRING: *const i8 = c"pont:f".as_ptr();
-
-const LONGOPTS: [cli::LongOption; 6] = [
-  cli::LongOption::new(c"primary", cli::NO_ARGUMENT, 'p'),
-  cli::LongOption::new(c"paste-once", cli::NO_ARGUMENT, 'o'),
-  cli::LongOption::new(c"trim-newline", cli::NO_ARGUMENT, 'n'),
-  cli::LongOption::new(c"foreground", cli::NO_ARGUMENT, 'f'),
-  cli::LongOption::new(c"type", cli::REQUIRED_ARGUMENT, 't'),
-  cli::LONG_OPTION_TERMINATOR,
-];
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn main(argc: isize, argv: *const *mut c_char) -> c_int {
@@ -94,36 +82,12 @@ pub unsafe extern "C" fn main(argc: isize, argv: *const *mut c_char) -> c_int {
   let mut trim_newline = false;
   let mut foreground = false;
   let mut wanted_mime: Option<MimeType> = None;
-  let mut longindex: c_int = 0;
-  unsafe { optind = 1 };
+  let mut is_stdin = true;
 
-  loop {
-    let c = unsafe {
-      cli::getopt_long(
-        argc as _,
-        argv,
-        OPTSTRING,
-        LONGOPTS.as_ptr(),
-        &raw mut longindex,
-      )
-    };
-    if c == -1 {
-      break;
-    }
-    match c as u8 as char {
-      'p' => use_primary = true,
-      'o' => paste_once = true,
-      'n' => trim_newline = true,
-      'f' => foreground = true,
-      't' if !unsafe { optarg.is_null() } => {
-        wanted_mime = Some(MimeType::from(unsafe { core::ffi::CStr::from_ptr(optarg) }));
-      }
-      _ => (),
-    }
+  if argc <= 0 || argv.is_null() {
+    return 1;
   }
 
-  // Create an anonymous file descriptor in RAM to hold the clipboard data
-  let optind_val = unsafe { optind };
   let memfd = match memfd_create(c"wl-clip", MemfdFlags::CLOEXEC) {
     Ok(mfd) => mfd,
     Err(e) => {
@@ -132,13 +96,29 @@ pub unsafe extern "C" fn main(argc: isize, argv: *const *mut c_char) -> c_int {
     }
   };
 
-  let is_stdin = optind_val >= argc as c_int;
-  if is_stdin {
-    if let Err(e) = write_stdin_to_fd(&memfd) {
-      e.write_diagnostic();
-      return 1;
+  let args_iter = unsafe { get_args_iter(argc as usize, argv) };
+  let mut parser = ArgParser::new(args_iter);
+  while let Some(arg) = parser.next_arg() {
+    match arg {
+      Arg::Short('p') | Arg::Long("primary") => use_primary = true,
+      Arg::Short('o') | Arg::Long("paste-once") => paste_once = true,
+      Arg::Short('n') | Arg::Long("trim-newline") => trim_newline = true,
+      Arg::Short('f') | Arg::Long("foreground") => foreground = true,
+      Arg::Short('t') | Arg::Long("type") => {
+        wanted_mime = parser.next_val().map(MimeType::from);
+      }
+      Arg::Value(val) => {
+        if let Err(e) = write_args_to_fd(&memfd, val) {
+          e.write_diagnostic();
+          return 1;
+        }
+        is_stdin = false;
+      }
+      _ => (),
     }
-  } else if let Err(e) = write_args_to_fd(&memfd, argv, optind_val as usize, argc.cast_unsigned()) {
+  }
+
+  if is_stdin && let Err(e) = write_stdin_to_fd(&memfd) {
     e.write_diagnostic();
     return 1;
   }
@@ -150,7 +130,7 @@ pub unsafe extern "C" fn main(argc: isize, argv: *const *mut c_char) -> c_int {
   // only stdin content is inferred from. an explicit argument list is already text the user
   // typed on the command line, and `-t` always takes priority over either.
   let inferred_mime = if is_stdin && wanted_mime.is_none() {
-    mime::infer_from_fd(&memfd)
+    infer_from_fd(&memfd)
   } else {
     None
   };
@@ -325,20 +305,8 @@ fn write_stdin_to_fd(fd: &OwnedFd) -> Result<(), AppError> {
   write_content_to_fd(stdin, fd, false)
 }
 
-/// writes argv to the given fd
-fn write_args_to_fd(
-  fd: &OwnedFd,
-  argv: *const *mut c_char,
-  start: usize,
-  argc: usize,
-) -> Result<(), AppError> {
-  for i in start..argc {
-    if i > start {
-      write_fd(fd, b" ", Some(1)).map_err(AppError::Sys)?;
-    }
-    let arg = unsafe { *argv.add(i) };
-    let bytes = unsafe { core::ffi::CStr::from_ptr(arg) }.to_bytes();
-    write_fd(fd, bytes, None).map_err(AppError::Sys)?;
-  }
+fn write_args_to_fd(fd: &OwnedFd, val: &str) -> Result<(), AppError> {
+  write_fd(fd, b" ", Some(1)).map_err(AppError::Sys)?;
+  write_fd(fd, val.as_bytes(), None).map_err(AppError::Sys)?;
   Ok(())
 }

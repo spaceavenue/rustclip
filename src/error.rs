@@ -20,12 +20,14 @@ impl AppError {
     match self {
       AppError::Wire(e) => e.write_diagnostic(),
       AppError::Sys(e) => WireError::Sys(*e).write_diagnostic(),
-      AppError::NothingCopied => write_stderr(b"rustclip: nothing is currently copied\n"),
+      AppError::NothingCopied => write_stderr("[rustclip]: nothing is currently copied\n"),
       AppError::MimeNotAvailable => {
-        write_stderr("rustclip: requested mime type not offered by the current selection\n");
+        write_stderr("[rustclip]: requested mime type not offered by the current selection\n");
       }
       AppError::InferredMimeNotAvailable => {
-        write_stderr("rustclip: clipboard content is not available as the inferred output type\n");
+        write_stderr(
+          "[rustclip]: clipboard content is not available as the inferred output type\n",
+        );
       }
     }
   }
