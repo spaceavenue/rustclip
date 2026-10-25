@@ -27,13 +27,14 @@ use rustix::io::read;
 use rustix::pipe::{PipeFlags, pipe_with};
 use rustix::process::{Pid, WaitOptions, waitpid};
 use rustix::stdio;
+use wllib::error::SysResultExt;
 use wllib::fmt_lite::StringOnStack;
 
 use crate::exit;
 use crate::signal::{SIG_DFL, SIGHUP, SIGPIPE, signal};
+use crate::syscall::{Fork, fork};
 
 unsafe extern "C" {
-  fn fork() -> c_int;
   fn execvp(file: *const c_char, argv: *const *const c_char) -> c_int;
 }
 
@@ -201,56 +202,55 @@ pub fn infer_from_fd(fd: &OwnedFd) -> Option<MimeType> {
 fn query_file_for_fd(fd: &OwnedFd) -> Option<MimeType> {
   let (read_fd, write_fd) = pipe_with(PipeFlags::CLOEXEC).ok()?;
 
-  let pid = unsafe { fork() };
-  if pid < 0 {
-    return None;
-  }
+  let fork_res = fork().syserr("fork").ok()?;
+  match fork_res {
+    Fork::Child => {
+      // close child's read end of the pipe.
+      drop(read_fd);
+      // route fd to stdin, write end to stdout of child process, then close child's write end.
+      let _ = stdio::dup2_stdin(fd);
+      let _ = stdio::dup2_stdout(&write_fd);
+      drop(write_fd);
 
-  if pid == 0 {
-    // close child's read end of the pipe.
-    drop(read_fd);
-    // route fd to stdin, write end to stdout of child process, then close child's write end.
-    let _ = stdio::dup2_stdin(fd);
-    let _ = stdio::dup2_stdout(&write_fd);
-    drop(write_fd);
+      // undo the inherited SIG_IGN. `file` shouldnt silently swallow a `SIGPIPE` from it's own
+      // stdout pipe closing early.
+      unsafe {
+        let _ = signal(SIGHUP, SIG_DFL);
+        let _ = signal(SIGPIPE, SIG_DFL);
+      }
 
-    // undo the inherited SIG_IGN. `file` shouldnt silently swallow a `SIGPIPE` from it's own stdout
-    // pipe closing early.
-    unsafe {
-      signal(SIGHUP, SIG_DFL);
-      signal(SIGPIPE, SIG_DFL);
+      if let Ok(devnull) = open(c"/dev/null", OFlags::WRONLY, Mode::empty()) {
+        let _ = stdio::dup2_stderr(&devnull);
+        drop(devnull);
+      }
+
+      let argv: [*const c_char; 5] = [
+        c"file".as_ptr(),
+        // drop leading "-: "
+        c"-b".as_ptr(),
+        // print type/subtype. -i/--mine print '; charset=...' as well
+        c"--mime-type".as_ptr(),
+        c"-".as_ptr(),
+        core::ptr::null(),
+      ];
+
+      unsafe {
+        execvp(argv[0], argv.as_ptr());
+      }
+      // only reached if execvp() fails
+      exit::exit(1);
     }
-
-    if let Ok(devnull) = open(c"/dev/null", OFlags::WRONLY, Mode::empty()) {
-      let _ = stdio::dup2_stderr(&devnull);
-      drop(devnull);
+    Fork::Parent(pid) => {
+      // this child needs an actual `waitpid` so its exit status can be checked below.
+      let (_, status) = waitpid(Pid::from_raw(pid as i32), WaitOptions::empty()).ok()??;
+      if status.exit_status() != Some(0) {
+        return None;
+      }
     }
-
-    let argv: [*const c_char; 5] = [
-      c"file".as_ptr(),
-      // drop leading "-: "
-      c"-b".as_ptr(),
-      // print type/subtype. -i/--mine print '; charset=...' as well
-      c"--mime-type".as_ptr(),
-      c"-".as_ptr(),
-      core::ptr::null(),
-    ];
-
-    unsafe {
-      execvp(argv[0], argv.as_ptr());
-    }
-    // only reached if execvp() fails
-    exit::exit(1);
   }
 
   // close parent's write end of the pipe so that the EOF arrives to the read end below.
   drop(write_fd);
-
-  // this child needs an actual `waitpid` so its exit status can be checked below.
-  let (_, status) = waitpid(Pid::from_raw(pid), WaitOptions::empty()).ok()??;
-  if status.exit_status() != Some(0) {
-    return None;
-  }
 
   let mut buf = [0u8; 256];
   let n = read(read_fd, &mut buf).ok()?;

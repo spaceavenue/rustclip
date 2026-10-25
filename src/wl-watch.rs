@@ -59,7 +59,7 @@ pub unsafe extern "C" fn main(argc: isize, argv: *const *mut c_char) -> c_int {
   let command_argv = unsafe { argv.add(cmd_idx) };
   let command_argc = argc as usize - cmd_idx;
 
-  unsafe { signal(SIGCHLD, SIG_IGN) };
+  let _ = unsafe { signal(SIGCHLD, SIG_IGN) };
 
   let mut conn = match Connection::connect() {
     Ok(c) => c,

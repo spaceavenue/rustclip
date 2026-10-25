@@ -6,7 +6,7 @@ use rustix::io::read;
 use rustix::pipe::{PipeFlags, pipe_with};
 use rustix::stdio::{dup2_stdin, stdout};
 use wllib::dispatch::EventHandler;
-use wllib::error::{SysError, SysResultExt, WireError};
+use wllib::error::SysResultExt;
 use wllib::io::write_stdout;
 use wllib::protocols::{zwlr_data_control_device_v1, zwlr_data_control_offer_v1};
 use wllib::registry::{GlobalHandler, bind, clamp_version};
@@ -18,9 +18,9 @@ use crate::exit;
 use crate::mime::{
   MAX_MIME_TYPES, MimeType, classify_offer_types, is_text_mime, mime_type_to_request,
 };
+use crate::syscall::{Fork, fork};
 
 unsafe extern "C" {
-  fn fork() -> c_int;
   fn execvp(file: *const c_char, argv: *const *const c_char) -> c_int;
   fn setenv(name: *const c_char, value: *const c_char, overwrite: c_int) -> c_int;
 }
@@ -285,12 +285,14 @@ fn run_with_stdin(
   if argc == 0 {
     return;
   }
-  let pid = unsafe { fork() };
-  if pid < 0 {
-    WireError::Sys(SysError::last("fork")).write_diagnostic();
-    return;
-  }
-  if pid == 0 {
+  let fork_res = match fork().syserr("fork") {
+    Ok(res) => res,
+    Err(e) => {
+      e.write_diagnostic();
+      return;
+    }
+  };
+  if let Fork::Child = fork_res {
     let _ = dup2_stdin(read_fd);
     unsafe {
       if !state.is_null() {

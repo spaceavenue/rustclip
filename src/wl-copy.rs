@@ -13,6 +13,7 @@ use core::ffi::{c_char, c_int};
 use rustclip::cli::{Arg, ArgParser, get_args_iter};
 use rustclip::error::AppError;
 use rustclip::mime::{self, GENERIC_TEXT_OFFERS, MimeType, infer_from_fd};
+use rustclip::syscall::{Fork, fork};
 use rustix::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use rustix::fs::{MemfdFlags, SeekFrom, ftruncate, memfd_create, seek};
 use rustix::io::read;
@@ -70,10 +71,6 @@ impl EventHandler for State {
 
 #[link(name = "c", kind = "static")]
 unsafe extern "C" {}
-
-unsafe extern "C" {
-  fn fork() -> c_int;
-}
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn main(argc: isize, argv: *const *mut c_char) -> c_int {
@@ -211,12 +208,13 @@ pub unsafe extern "C" fn main(argc: isize, argv: *const *mut c_char) -> c_int {
   conn.send_logged(&select_msg, None);
 
   if !foreground {
-    let pid = unsafe { fork() };
-    if pid < 0 {
-      write_stderr("[wl-copy]: failed to fork process\n");
-      return 1;
-    } else if pid > 0 {
-      return 0;
+    match fork().syserr("fork") {
+      Ok(Fork::Child) => {}
+      Ok(Fork::Parent(_)) => return 0,
+      Err(e) => {
+        e.write_diagnostic();
+        return 1;
+      }
     }
   }
 
