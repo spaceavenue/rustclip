@@ -1,10 +1,14 @@
 //! Direct syscall and process management helpers.
 
-use core::arch::asm;
+use core::arch::{asm, naked_asm};
 use core::ffi::{CStr, c_char, c_int};
 use core::hint::unreachable_unchecked;
+use core::ptr;
 
 use rustix::io::Errno;
+use wllib::fmt_lite::StringOnStack;
+
+use crate::env::{get_env, get_envp};
 
 const SYS_FORK: usize = 57;
 const SYS_EXECVE: usize = 59;
@@ -18,6 +22,55 @@ fn check_ret(ret: isize) -> Result<usize, Errno> {
   } else {
     Ok(ret as usize)
   }
+}
+
+#[inline]
+unsafe fn search_path_and_exec(
+  path: *const c_char,
+  argv: *const *const c_char,
+  envp: *const *const c_char,
+) -> Errno {
+  let empty_envp = [ptr::null::<c_char>()];
+  let envp = if envp.is_null() {
+    empty_envp.as_ptr()
+  } else {
+    envp
+  };
+  let cstr = unsafe { CStr::from_ptr(path) };
+  let bytes = cstr.to_bytes();
+
+  if bytes.contains(&b'/') {
+    return unsafe { execve(path, argv, envp) };
+  }
+
+  let mut path_buf = StringOnStack::<512>::new();
+  let has_path = get_env("PATH", &mut path_buf);
+  let path_str = if has_path {
+    path_buf.as_str()
+  } else {
+    "/usr/bin:/bin"
+  };
+
+  let mut last_err = Errno::NOENT;
+
+  for dir in path_str.split(':') {
+    let dir = if dir.is_empty() { "." } else { dir };
+    let mut candidate = StringOnStack::<256>::new();
+    candidate.push(dir);
+    if !candidate.ends_with('/') {
+      candidate.push("/");
+    }
+    candidate.push(cstr.to_str().unwrap_or(""));
+
+    let err = unsafe { execve(candidate.as_c_str().as_ptr(), argv, envp) };
+    if err == Errno::ACCESS {
+      last_err = Errno::ACCESS;
+    } else if err != Errno::NOENT {
+      return err;
+    }
+  }
+
+  last_err
 }
 
 pub enum Fork {
@@ -76,55 +129,27 @@ pub unsafe fn execve(
   }
 }
 
-/// Execute a file with arguments, searching `PATH` if `file` does not contain a slash.
+/// Execute an execve syscall, searching `PATH` if `path` is not absolute.
 ///
 /// # Safety
-/// `file` must point to a null-terminated C string.
+/// `path` must point to a null-terminated C string.
 /// `argv` must point to a null-terminated array of null-terminated string pointers.
-pub unsafe fn execvp(file: *const c_char, argv: *const *const c_char) -> Errno {
-  let envp = crate::env::get_envp();
-  let empty_envp: [*const c_char; 1] = [core::ptr::null()];
-  let envp = if envp.is_null() {
-    empty_envp.as_ptr()
-  } else {
-    envp
-  };
+pub unsafe fn execvp(path: *const c_char, argv: *const *const c_char) -> Errno {
+  unsafe { search_path_and_exec(path, argv, get_envp()) }
+}
 
-  let cstr = unsafe { CStr::from_ptr(file) };
-  let bytes = cstr.to_bytes();
-
-  if bytes.contains(&b'/') {
-    return unsafe { execve(file, argv, envp) };
-  }
-
-  let mut path_buf = wllib::fmt_lite::StringOnStack::<512>::new();
-  let has_path = crate::env::get_env("PATH", &mut path_buf);
-  let path_str = if has_path {
-    path_buf.as_str()
-  } else {
-    "/usr/bin:/bin"
-  };
-
-  let mut last_err = Errno::NOENT;
-
-  for dir in path_str.split(':') {
-    let dir = if dir.is_empty() { "." } else { dir };
-    let mut candidate = wllib::fmt_lite::StringOnStack::<256>::new();
-    candidate.push(dir);
-    if !candidate.ends_with('/') {
-      candidate.push("/");
-    }
-    candidate.push(cstr.to_str().unwrap_or(""));
-
-    let err = unsafe { execve(candidate.as_c_str().as_ptr(), argv, envp) };
-    if err == Errno::ACCESS {
-      last_err = Errno::ACCESS;
-    } else if err != Errno::NOENT {
-      return err;
-    }
-  }
-
-  last_err
+/// Execute an execve syscall, searching `PATH` if `path` is not absolute and passing
+/// additional environment pointed to by `envp`.
+///
+/// # Safety
+/// `path` must point to a null-terminated C string.
+/// `argv` must point to a null-terminated array of null-terminated string pointers.
+pub unsafe fn execvpe(
+  path: *const c_char,
+  argv: *const *const c_char,
+  envp: *const *const c_char,
+) -> Errno {
+  unsafe { search_path_and_exec(path, argv, envp) }
 }
 
 pub mod exit {
@@ -168,8 +193,7 @@ pub mod signal {
   // handler, the flags, the restorer and a mask.
   // a custom handler in particular requires SA_RESTORER in sa_flags, and sa_restorer pointing to
   // something that calls SYS_rt_sigreturn.
-  use super::{Errno, SYS_RT_SIGACTION, asm, c_int, check_ret};
-
+  use super::{Errno, SYS_RT_SIGACTION, asm, c_int, check_ret, naked_asm, ptr};
   pub const SIGHUP: c_int = 1;
   pub const SIGUSR1: c_int = 10;
   pub const SIGPIPE: c_int = 13;
@@ -184,7 +208,7 @@ pub mod signal {
   #[cfg(target_arch = "x86_64")]
   #[unsafe(naked)]
   pub unsafe extern "C" fn default_restorer() {
-    core::arch::naked_asm!(
+    naked_asm!(
       "mov rax, 15", // SYS_rt_sigreturn
       "syscall"
     );
@@ -247,6 +271,6 @@ pub mod signal {
   /// Wrapper for sigaction call with `SA_RESTART` set.
   pub unsafe fn signal(sig: i32, handler: usize) -> Result<(), Errno> {
     let act = KernelSigaction::new(handler, SA_RESTART);
-    unsafe { sigaction(sig, &act, core::ptr::null_mut()) }
+    unsafe { sigaction(sig, &act, ptr::null_mut()) }
   }
 }

@@ -1,3 +1,5 @@
+//! Diagnostic logging and error rendering for applications.
+
 use rustix::fd::OwnedFd;
 use wllib::error::{SysError, WireError};
 use wllib::fmt_lite::StringOnStack;
@@ -25,7 +27,7 @@ pub fn write_wire_diagnostic(prefix: &str, err: &WireError) {
     WireError::InvalidPath => {
       let mut s = StringOnStack::<128>::new();
       s.push(prefix)
-        .push(" WAYLAND_DISPLAY or XDG_RUNTIME_DIR not set (or invalid socket path)\n");
+        .push(" WAYLAND_DISPLAY or XDG_RUNTIME_DIR not set or socket path invalid\n");
       write_stderr(s);
     }
     WireError::BufferTooSmall => {
@@ -62,7 +64,7 @@ pub trait ConnectionExt {
 impl ConnectionExt for Connection {
   fn send_logged(&self, msg: &Message, fd: Option<&OwnedFd>) {
     if let Err(e) = self.send(msg, fd) {
-      write_wire_diagnostic("[rustclip]", &e);
+      write_wire_diagnostic("wllib", &e);
     }
   }
 }

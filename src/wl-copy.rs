@@ -69,8 +69,6 @@ impl EventHandler for State {
   fn handle_event(&mut self, _conn: &mut Connection, _sender: u32, _opcode: u16, _data: &[u8]) {}
 }
 
-#[link(name = "c", kind = "static")]
-unsafe extern "C" {}
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn main(argc: isize, argv: *const *mut c_char) -> c_int {

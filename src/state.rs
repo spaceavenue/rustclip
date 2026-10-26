@@ -1,4 +1,5 @@
-use core::ffi::{c_char, c_int};
+use core::ffi::{CStr, c_char};
+use core::ptr;
 
 use rustix::fd::OwnedFd;
 use rustix::fs::{Mode, OFlags, open};
@@ -7,22 +8,20 @@ use rustix::pipe::{PipeFlags, pipe_with};
 use rustix::stdio::{dup2_stdin, stdout};
 use wllib::dispatch::EventHandler;
 use wllib::error::SysResultExt;
+use wllib::fmt_lite::StringOnStack;
 use wllib::protocols::{zwlr_data_control_device_v1, zwlr_data_control_offer_v1};
 use wllib::registry::{GlobalHandler, bind, clamp_version};
 use wllib::transport::Connection;
 use wllib::wire::{Message, read_str, read_u32};
 
+use crate::env::get_envp;
 use crate::error::{AppError, ConnectionExt, write_wire_diagnostic};
 use crate::exit;
 use crate::io::{write_fd, write_stdout};
 use crate::mime::{
   MAX_MIME_TYPES, MimeType, classify_offer_types, is_text_mime, mime_type_to_request,
 };
-use crate::syscall::{Fork, execvp, fork};
-
-unsafe extern "C" {
-  fn setenv(name: *const c_char, value: *const c_char, overwrite: c_int) -> c_int;
-}
+use crate::syscall::{Fork, execvpe, fork};
 
 // tracks registered object ids
 #[derive(Default)]
@@ -109,7 +108,7 @@ impl State {
       if let Action::PipeToCommand { argv, argc } = &self.action
         && let Ok(devnull) = open(c"/dev/null", OFlags::RDONLY, Mode::empty())
       {
-        run_with_stdin(devnull, *argv, *argc, c"nil".as_ptr(), core::ptr::null());
+        run_with_stdin(devnull, *argv, *argc, c"nil", c"");
       }
       return;
     }
@@ -185,11 +184,11 @@ impl State {
         }
         Action::PipeToCommand { argv, argc } => {
           let state_cstr = if classified.has_sensitive_hint {
-            c"sensitive".as_ptr()
+            c"sensitive"
           } else {
-            c"data".as_ptr()
+            c"data"
           };
-          let type_cstr = selected_mime.as_ptr();
+          let type_cstr = selected_mime.as_c_str();
           run_with_stdin(read_fd, *argv, *argc, state_cstr, type_cstr);
         }
         Action::ListTypes => unreachable!(),
@@ -278,8 +277,8 @@ fn run_with_stdin(
   read_fd: OwnedFd,
   argv: *const *mut c_char,
   argc: usize,
-  state: *const c_char,
-  mime_type: *const c_char,
+  state: &CStr,
+  mime_type: &CStr,
 ) {
   if argc == 0 {
     return;
@@ -293,18 +292,46 @@ fn run_with_stdin(
   };
   if let Fork::Child = fork_res {
     let _ = dup2_stdin(read_fd);
-    unsafe {
-      if !state.is_null() {
-        setenv(c"CLIPBOARD_STATE".as_ptr(), state, 1);
+
+    let mut state_var = StringOnStack::<32>::new();
+    state_var.push("CLIPBOARD_STATE=").push(state);
+
+    let mut type_var = StringOnStack::<160>::new();
+    type_var.push("CLIPBOARD_TYPE=").push(mime_type);
+
+    let parent_envp = get_envp();
+    let mut child_envp = [ptr::null::<c_char>(); 256];
+    let mut count = 0;
+
+    if !parent_envp.is_null() {
+      let mut cur = parent_envp;
+      while !unsafe { *cur }.is_null() && count < child_envp.len() - 3 {
+        let entry = unsafe { *cur };
+        let bytes = unsafe { CStr::from_ptr(entry).to_bytes() };
+        if !bytes.starts_with(b"CLIPBOARD_STATE=") && !bytes.starts_with(b"CLIPBOARD_TYPE=") {
+          child_envp[count] = entry;
+          count += 1;
+        }
+        cur = unsafe { cur.add(1) };
       }
-      if !mime_type.is_null() {
-        setenv(c"CLIPBOARD_TYPE".as_ptr(), mime_type, 1);
-      }
-      // `argv` came straight from `main`'s own argv, which the OS guarantees is NUL-terminated at
-      // argv[argc]. so, a pointer offset into it is still validly NUL-terminated and this can be
-      // handed to execvp directly without rebuilding it.
-      execvp((*argv).cast_const(), argv.cast());
     }
+
+    if !state.to_bytes().is_empty() && count < child_envp.len() - 2 {
+      child_envp[count] = state_var.as_c_str().as_ptr();
+      count += 1;
+    }
+
+    if !mime_type.to_bytes().is_empty() && count < child_envp.len() - 1 {
+      child_envp[count] = type_var.as_c_str().as_ptr();
+      count += 1;
+    }
+
+    child_envp[count] = ptr::null();
+
+    unsafe {
+      execvpe((*argv).cast_const(), argv.cast(), child_envp.as_ptr());
+    }
+
     // only reached if exec itself failed
     exit::exit(1);
   }

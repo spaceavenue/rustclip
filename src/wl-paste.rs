@@ -15,8 +15,6 @@ use wllib::protocols::zwlr_data_control_manager_v1;
 use wllib::registry::crawl;
 use wllib::wire::Message;
 
-#[link(name = "c", kind = "static")]
-unsafe extern "C" {}
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn main(argc: isize, argv: *const *mut c_char) -> c_int {
