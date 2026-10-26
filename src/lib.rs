@@ -1,9 +1,13 @@
 #![no_std]
 
 pub mod cli;
+pub mod env;
 pub mod error;
+pub mod io;
 pub mod mime;
 pub mod state;
 pub mod syscall;
 
-use syscall::{exit, signal};
+pub use env::connect_wayland;
+pub use error::ConnectionExt;
+pub use syscall::{execvp, exit, fork, signal};

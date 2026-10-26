@@ -5,14 +5,14 @@
 use core::ffi::{c_char, c_int};
 
 use rustclip::cli::{Arg, ArgParser, get_args_iter};
+use rustclip::error::{ConnectionExt, write_wire_diagnostic};
+use rustclip::io::write_stderr;
 use rustclip::mime::MimeType;
 use rustclip::state::{Action, State};
 use rustclip::syscall::signal::{SIG_IGN, SIGCHLD, signal};
 use wllib::dispatch::dispatch_once;
-use wllib::io::write_stderr;
 use wllib::protocols::zwlr_data_control_manager_v1;
 use wllib::registry::crawl;
-use wllib::transport::Connection;
 use wllib::wire::Message;
 
 #[link(name = "c", kind = "static")]
@@ -61,10 +61,10 @@ pub unsafe extern "C" fn main(argc: isize, argv: *const *mut c_char) -> c_int {
 
   let _ = unsafe { signal(SIGCHLD, SIG_IGN) };
 
-  let mut conn = match Connection::connect() {
+  let mut conn = match rustclip::connect_wayland() {
     Ok(c) => c,
     Err(e) => {
-      e.write_diagnostic();
+      write_wire_diagnostic("wl-watch", &e);
       return 1;
     }
   };
@@ -75,7 +75,7 @@ pub unsafe extern "C" fn main(argc: isize, argv: *const *mut c_char) -> c_int {
   let mut state = State::init(use_primary, wanted_mime, None, false, action);
 
   if let Err(e) = crawl(&mut conn, &mut state) {
-    e.write_diagnostic();
+    write_wire_diagnostic("wl-watch", &e);
     return 1;
   }
 
@@ -102,7 +102,7 @@ pub unsafe extern "C" fn main(argc: isize, argv: *const *mut c_char) -> c_int {
   // main wayland event dispatch loop
   loop {
     if let Err(e) = dispatch_once(&mut conn, &mut state) {
-      e.write_diagnostic();
+      write_wire_diagnostic("wl-watch", &e);
       return 1;
     }
   }

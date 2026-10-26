@@ -11,17 +11,17 @@
 use core::ffi::{c_char, c_int};
 
 use rustclip::cli::{Arg, ArgParser, get_args_iter};
-use rustclip::error::AppError;
 use rustclip::mime::{self, GENERIC_TEXT_OFFERS, MimeType, infer_from_fd};
 use rustclip::syscall::{Fork, fork};
 use rustix::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use rustix::fs::{MemfdFlags, SeekFrom, ftruncate, memfd_create, seek};
 use rustix::io::read;
 use rustix::stdio::stdin;
+use rustclip::error::{AppError, ConnectionExt, write_wire_diagnostic};
+use rustclip::io::{write_fd, write_stderr};
 use wllib::dispatch::EventHandler;
 use wllib::error::{SysError, SysResultExt, WireError};
 use wllib::fmt_lite::StringOnStack;
-use wllib::io::{write_fd, write_stderr};
 use wllib::protocols::{
   zwlr_data_control_device_v1, zwlr_data_control_manager_v1, zwlr_data_control_source_v1,
 };
@@ -49,14 +49,14 @@ impl GlobalHandler for State {
         let id = conn.alloc_id();
         match bind(conn, name, interface, clamp_version(1, version), id) {
           Ok(()) => self.global.seat_id = id,
-          Err(e) => e.write_diagnostic(),
+          Err(e) => write_wire_diagnostic("wl-copy", &e),
         }
       }
       "zwlr_data_control_manager_v1" => {
         let id = conn.alloc_id();
         match bind(conn, name, interface, clamp_version(2, version), id) {
           Ok(()) => self.global.manager_id = id,
-          Err(e) => e.write_diagnostic(),
+          Err(e) => write_wire_diagnostic("wl-copy", &e),
         }
       }
       _ => (),
@@ -132,10 +132,10 @@ pub unsafe extern "C" fn main(argc: isize, argv: *const *mut c_char) -> c_int {
     None
   };
 
-  let mut conn = match Connection::connect() {
+  let mut conn = match rustclip::connect_wayland() {
     Ok(c) => c,
     Err(e) => {
-      e.write_diagnostic();
+      write_wire_diagnostic("wl-copy", &e);
       return 1;
     }
   };
@@ -144,7 +144,7 @@ pub unsafe extern "C" fn main(argc: isize, argv: *const *mut c_char) -> c_int {
     global: Global::default(),
   };
   if let Err(e) = crawl(&mut conn, &mut state) {
-    e.write_diagnostic();
+    write_wire_diagnostic("wl-copy", &e);
     return 1;
   }
 
@@ -212,7 +212,7 @@ pub unsafe extern "C" fn main(argc: isize, argv: *const *mut c_char) -> c_int {
       Ok(Fork::Child) => {}
       Ok(Fork::Parent(_)) => return 0,
       Err(e) => {
-        e.write_diagnostic();
+        write_wire_diagnostic("wl-copy", &e);
         return 1;
       }
     }
@@ -227,7 +227,7 @@ pub unsafe extern "C" fn main(argc: isize, argv: *const *mut c_char) -> c_int {
       Ok(items) => items,
       Err(WireError::ConnectionClosed) => break,
       Err(e) => {
-        e.write_diagnostic();
+        write_wire_diagnostic("wl-copy", &e);
         break;
       }
     };

@@ -69,7 +69,6 @@ dependencies = [
 [[package]]
 name = "wllib"
 version = "0.1.0"
-source = "git+https://github.com/spaceavenue/wllib.git#a8d53a92c4d669e562f65278aad5f1fea7d0ece4"
 dependencies = [
  "rustix",
 ]

@@ -1,7 +1,7 @@
 //! Direct syscall and process management helpers.
 
 use core::arch::asm;
-use core::ffi::{c_char, c_int};
+use core::ffi::{CStr, c_char, c_int};
 use core::hint::unreachable_unchecked;
 
 use rustix::io::Errno;
@@ -76,6 +76,57 @@ pub unsafe fn execve(
   }
 }
 
+/// Execute a file with arguments, searching `PATH` if `file` does not contain a slash.
+///
+/// # Safety
+/// `file` must point to a null-terminated C string.
+/// `argv` must point to a null-terminated array of null-terminated string pointers.
+pub unsafe fn execvp(file: *const c_char, argv: *const *const c_char) -> Errno {
+  let envp = crate::env::get_envp();
+  let empty_envp: [*const c_char; 1] = [core::ptr::null()];
+  let envp = if envp.is_null() {
+    empty_envp.as_ptr()
+  } else {
+    envp
+  };
+
+  let cstr = unsafe { CStr::from_ptr(file) };
+  let bytes = cstr.to_bytes();
+
+  if bytes.contains(&b'/') {
+    return unsafe { execve(file, argv, envp) };
+  }
+
+  let mut path_buf = wllib::fmt_lite::StringOnStack::<512>::new();
+  let has_path = crate::env::get_env("PATH", &mut path_buf);
+  let path_str = if has_path {
+    path_buf.as_str()
+  } else {
+    "/usr/bin:/bin"
+  };
+
+  let mut last_err = Errno::NOENT;
+
+  for dir in path_str.split(':') {
+    let dir = if dir.is_empty() { "." } else { dir };
+    let mut candidate = wllib::fmt_lite::StringOnStack::<256>::new();
+    candidate.push(dir);
+    if !candidate.ends_with('/') {
+      candidate.push("/");
+    }
+    candidate.push(cstr.to_str().unwrap_or(""));
+
+    let err = unsafe { execve(candidate.as_c_str().as_ptr(), argv, envp) };
+    if err == Errno::ACCESS {
+      last_err = Errno::ACCESS;
+    } else if err != Errno::NOENT {
+      return err;
+    }
+  }
+
+  last_err
+}
+
 pub mod exit {
 
   use super::{SYS_EXIT_GROUP, asm};
@@ -106,7 +157,7 @@ pub mod exit {
   /// Write an error message to stderr and exit with code 1.
   #[inline]
   pub fn die(msg: &str) -> ! {
-    wllib::io::write_stderr(msg);
+    crate::io::write_stderr(msg);
     exit(1)
   }
 }

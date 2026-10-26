@@ -7,21 +7,20 @@ use rustix::pipe::{PipeFlags, pipe_with};
 use rustix::stdio::{dup2_stdin, stdout};
 use wllib::dispatch::EventHandler;
 use wllib::error::SysResultExt;
-use wllib::io::write_stdout;
 use wllib::protocols::{zwlr_data_control_device_v1, zwlr_data_control_offer_v1};
 use wllib::registry::{GlobalHandler, bind, clamp_version};
 use wllib::transport::Connection;
 use wllib::wire::{Message, read_str, read_u32};
 
-use crate::error::AppError;
+use crate::error::{AppError, ConnectionExt, write_wire_diagnostic};
 use crate::exit;
+use crate::io::{write_fd, write_stdout};
 use crate::mime::{
   MAX_MIME_TYPES, MimeType, classify_offer_types, is_text_mime, mime_type_to_request,
 };
-use crate::syscall::{Fork, fork};
+use crate::syscall::{Fork, execvp, fork};
 
 unsafe extern "C" {
-  fn execvp(file: *const c_char, argv: *const *const c_char) -> c_int;
   fn setenv(name: *const c_char, value: *const c_char, overwrite: c_int) -> c_int;
 }
 
@@ -211,14 +210,14 @@ impl GlobalHandler for State {
         let id = conn.alloc_id();
         match bind(conn, name, interface, clamp_version(1, version), id) {
           Ok(()) => self.global.seat_id = id,
-          Err(e) => e.write_diagnostic(),
+          Err(e) => write_wire_diagnostic("[rustclip]", &e),
         }
       }
       "zwlr_data_control_manager_v1" => {
         let id = conn.alloc_id();
         match bind(conn, name, interface, clamp_version(1, version), id) {
           Ok(()) => self.global.manager_id = id,
-          Err(e) => e.write_diagnostic(),
+          Err(e) => write_wire_diagnostic("[rustclip]", &e),
         }
       }
       _ => (),
@@ -267,7 +266,7 @@ fn stream_fd_to_stdout(read_fd: OwnedFd) -> Result<(), AppError> {
       break;
     }
     let stdout = unsafe { stdout() };
-    wllib::io::write_fd(stdout, &buf[..n as usize], None).map_err(AppError::Sys)?;
+    write_fd(stdout, &buf[..n as usize], None).map_err(AppError::Sys)?;
   }
 
   Ok(())
@@ -288,7 +287,7 @@ fn run_with_stdin(
   let fork_res = match fork().syserr("fork") {
     Ok(res) => res,
     Err(e) => {
-      e.write_diagnostic();
+      write_wire_diagnostic("[rustclip]", &e);
       return;
     }
   };

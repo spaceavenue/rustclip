@@ -18,7 +18,7 @@
 // prioritize explicit requested types, then inferred types, then UTF-8 / plain text fallbacks —
 // matching wl-clipboard's behavior of the same name.
 
-use core::ffi::{c_char, c_int};
+use core::ffi::c_char;
 use core::str;
 
 use rustix::fd::{AsFd, AsRawFd, OwnedFd};
@@ -32,11 +32,7 @@ use wllib::fmt_lite::StringOnStack;
 
 use crate::exit;
 use crate::signal::{SIG_DFL, SIGHUP, SIGPIPE, signal};
-use crate::syscall::{Fork, fork};
-
-unsafe extern "C" {
-  fn execvp(file: *const c_char, argv: *const *const c_char) -> c_int;
-}
+use crate::syscall::{Fork, execvp, fork};
 
 pub const MAX_MIME_LEN: usize = 128;
 pub const MAX_MIME_TYPES: usize = 128;
