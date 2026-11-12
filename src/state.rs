@@ -1,35 +1,105 @@
 use core::ffi::{CStr, c_char};
 use core::ptr;
 
-use rustix::fd::OwnedFd;
+use rustix::fd::{AsFd, OwnedFd};
 use rustix::fs::{Mode, OFlags, open};
 use rustix::io::read;
 use rustix::pipe::{PipeFlags, pipe_with};
 use rustix::stdio::{dup2_stdin, stdout};
 use wllib::dispatch::EventHandler;
-use wllib::error::SysResultExt;
-use wllib::fmt_lite::StringOnStack;
-use wllib::protocols::{zwlr_data_control_device_v1, zwlr_data_control_offer_v1};
+use wllib::error::{SysResultExt, WireError};
+use wllib::protocols::{
+  zwlr_data_control_device_v1, zwlr_data_control_manager_v1, zwlr_data_control_offer_v1,
+};
 use wllib::registry::{GlobalHandler, bind, clamp_version};
-use wllib::transport::Connection;
-use wllib::wire::{Message, read_str, read_u32};
+use wllib::transport::{Connection, Ctx};
+use wllib::wire::{Message, Writer};
 
 use crate::env::get_envp;
-use crate::error::{AppError, ConnectionExt, write_wire_diagnostic};
+use crate::error::{AppError, write_wire_diagnostic};
 use crate::exit;
-use crate::io::{write_fd, write_stdout};
+use crate::fmt_lite::StringOnStack;
+use crate::io::{write_fd, write_stderr, write_stdout};
 use crate::mime::{
   MAX_MIME_TYPES, MimeType, classify_offer_types, is_text_mime, mime_type_to_request,
 };
 use crate::syscall::{Fork, execvpe, fork};
 
-// tracks registered object ids
+const MANAGER_VERSION: u32 = 2;
+
 #[derive(Default)]
 pub struct Global {
   // wl_seat global id
   pub seat_id: u32,
   // zwlr_data_control_manager global id
   pub manager_id: u32,
+}
+
+impl Global {
+  /// Bind the globals every clipboard binary needs. Call this from your `GlobalHandler::on_global`.
+  /// We bind to the minimum of the client's wanted version and the server's advertised version.
+  pub fn bind_global(
+    &mut self,
+    cx: &mut Ctx<'_>,
+    name: u32,
+    interface: &str,
+    version: u32,
+  ) -> Result<(), WireError> {
+    match interface {
+      "wl_seat" => {
+        if self.seat_id != 0 {
+          return Ok(());
+        }
+        let id = cx.alloc()?;
+        bind(cx, name, interface, clamp_version(1, version), id)?;
+        self.seat_id = id;
+      }
+      "zwlr_data_control_manager_v1" => {
+        let id = cx.alloc()?;
+        bind(
+          cx,
+          name,
+          interface,
+          clamp_version(MANAGER_VERSION, version),
+          id,
+        )?;
+        self.manager_id = id;
+      }
+      _ => (),
+    }
+    Ok(())
+  }
+
+  /// Check that `crawl` found everything we need. Prints a diagnostic tagged with `prog` and
+  /// returns `false` if not.
+  #[must_use]
+  pub fn require(&self, prog: &str) -> bool {
+    let mut s = StringOnStack::<96>::new();
+    if self.manager_id == 0 {
+      s.push("[")
+        .push(prog)
+        .push("]: compositor does not support wlr-data-control\n");
+    } else if self.seat_id == 0 {
+      s.push("[").push(prog).push("]: no wl_seat found\n");
+    } else {
+      return true;
+    }
+    write_stderr(s);
+    false
+  }
+
+  /// Ask the manager for a data device on the seat, so selection events start flowing. Returns
+  /// the new device's object id.
+  pub fn create_device<const N: usize>(&self, conn: &mut Connection<N>) -> Result<u32, WireError> {
+    let device_id = conn.alloc_id()?;
+    let mut w = Writer::<16>::new(
+      self.manager_id,
+      zwlr_data_control_manager_v1::request::GET_DATA_DEVICE,
+    );
+    w.u32(device_id).u32(self.seat_id);
+    conn.send(w.finish()?, &[])?;
+    Ok(device_id)
+  }
 }
 
 pub enum Action {
@@ -83,13 +153,24 @@ impl State {
     }
   }
 
+  /// Create the data device and remember its id so its events can be recognised.
+  pub fn create_device<const N: usize>(
+    &mut self,
+    conn: &mut Connection<N>,
+  ) -> Result<(), WireError> {
+    self.device_id = self.global.create_device(conn)?;
+    Ok(())
+  }
+
   // if we get a data offer, we update building the building id to whatever the data offer sets.
   // otherwise, we check which clipboard we're operating on and handle the selection.
-  fn handle_device_event(&mut self, conn: &mut Connection, opcode: u16, data: &[u8]) {
+  fn handle_device_event(&mut self, cx: &mut Ctx<'_>, msg: &Message<'_>) -> Result<(), WireError> {
+    let opcode = msg.header.opcode;
+    let mut args = msg.args();
     if opcode == zwlr_data_control_device_v1::event::DATA_OFFER {
-      self.building_id = read_u32(data, 0);
+      self.building_id = args.u32()?;
       self.building_mime_len = 0;
-      return;
+      return Ok(());
     }
     let is_target_event = if self.use_primary {
       opcode == zwlr_data_control_device_v1::event::PRIMARY_SELECTION
@@ -97,11 +178,12 @@ impl State {
       opcode == zwlr_data_control_device_v1::event::SELECTION
     };
     if is_target_event {
-      self.handle_selection(conn, read_u32(data, 0));
+      self.handle_selection(cx, args.u32()?);
     }
+    Ok(())
   }
 
-  fn handle_selection(&mut self, conn: &mut Connection, offer_id: u32) {
+  fn handle_selection(&mut self, cx: &Ctx<'_>, offer_id: u32) {
     // offer id 0 means empty clipboard or that it was cleared.
     if offer_id == 0 {
       self.had_empty_selection = true;
@@ -131,26 +213,14 @@ impl State {
     let mimes = &self.building_mimes[..self.building_mime_len];
     let classified = classify_offer_types(
       mimes,
-      self
-        .wanted_mime
-        .as_ref()
-        .map(wllib::fmt_lite::StringOnStack::as_str),
-      self
-        .inferred_mime
-        .as_ref()
-        .map(wllib::fmt_lite::StringOnStack::as_str),
+      self.wanted_mime.as_ref().map(StringOnStack::as_str),
+      self.inferred_mime.as_ref().map(StringOnStack::as_str),
     );
 
     let Some(selected_mime) = mime_type_to_request(
       &classified,
-      self
-        .wanted_mime
-        .as_ref()
-        .map(wllib::fmt_lite::StringOnStack::as_str),
-      self
-        .inferred_mime
-        .as_ref()
-        .map(wllib::fmt_lite::StringOnStack::as_str),
+      self.wanted_mime.as_ref().map(StringOnStack::as_str),
+      self.inferred_mime.as_ref().map(StringOnStack::as_str),
     ) else {
       // route these through AppError rather than distinct inline write_stderr calls, both so the
       // three cases share one place their wording lives) and so the message isn't hardcoded to
@@ -171,7 +241,7 @@ impl State {
       exit::exit(1);
     };
 
-    match fetch_offer(conn, offer_id, &selected_mime) {
+    match fetch_offer(cx, offer_id, &selected_mime) {
       Ok(read_fd) => match &self.action {
         Action::PrintAndExit => {
           if let Err(e) = stream_fd_to_stdout(read_fd) {
@@ -198,44 +268,32 @@ impl State {
   }
 }
 impl GlobalHandler for State {
-  // bind globals matching interfaces we want. we bind to the minimum of the client's wanted
-  // version and the server's advertised version
-  fn on_global(&mut self, conn: &mut Connection, name: u32, interface: &str, version: u32) {
-    match interface {
-      "wl_seat" => {
-        if self.global.seat_id != 0 {
-          return;
-        }
-        let id = conn.alloc_id();
-        match bind(conn, name, interface, clamp_version(1, version), id) {
-          Ok(()) => self.global.seat_id = id,
-          Err(e) => write_wire_diagnostic("[rustclip]", &e),
-        }
-      }
-      "zwlr_data_control_manager_v1" => {
-        let id = conn.alloc_id();
-        match bind(conn, name, interface, clamp_version(1, version), id) {
-          Ok(()) => self.global.manager_id = id,
-          Err(e) => write_wire_diagnostic("[rustclip]", &e),
-        }
-      }
-      _ => (),
-    }
+  fn on_global(
+    &mut self,
+    cx: &mut Ctx<'_>,
+    name: u32,
+    interface: &str,
+    version: u32,
+  ) -> Result<(), WireError> {
+    self.global.bind_global(cx, name, interface, version)
   }
 }
+
 impl EventHandler for State {
-  fn handle_event(&mut self, conn: &mut Connection, sender: u32, opcode: u16, data: &[u8]) {
+  fn handle_event(&mut self, cx: &mut Ctx<'_>, msg: Message<'_>) -> Result<(), WireError> {
+    let sender = msg.header.object_id;
     if sender == self.device_id {
-      self.handle_device_event(conn, opcode, data);
+      return self.handle_device_event(cx, &msg);
     }
     if sender == self.building_id
-      && opcode == zwlr_data_control_offer_v1::event::OFFER
-      && let Some((mime_str, _)) = read_str(data, 0)
+      && msg.header.opcode == zwlr_data_control_offer_v1::event::OFFER
       && self.building_mime_len < MAX_MIME_TYPES
     {
+      let mime_str = msg.args().str()?;
       self.building_mimes[self.building_mime_len] = MimeType::from(mime_str);
       self.building_mime_len += 1;
     }
+    Ok(())
   }
 }
 
@@ -244,12 +302,12 @@ impl EventHandler for State {
 // held by whichever process is providing the data) still needs to close its own copy too before the
 // reader sees EOF, but if we kept ours open as well, EOF would never arrive at all even after the
 // real writer finishes.
-fn fetch_offer(conn: &mut Connection, offer_id: u32, mime: &MimeType) -> Result<OwnedFd, AppError> {
+fn fetch_offer(cx: &Ctx<'_>, offer_id: u32, mime: &MimeType) -> Result<OwnedFd, AppError> {
   let (read_fd, write_fd) = pipe_with(PipeFlags::CLOEXEC).syserr("pipe")?;
 
-  let mut msg = Message::new(offer_id, zwlr_data_control_offer_v1::request::RECEIVE);
-  msg.write_str(mime.as_str());
-  conn.send_logged(&msg, Some(&write_fd));
+  let mut w = Writer::<192>::new(offer_id, zwlr_data_control_offer_v1::request::RECEIVE);
+  w.str(mime.as_str());
+  cx.send(w.finish()?, &[write_fd.as_fd()])?;
 
   Ok(read_fd)
 }

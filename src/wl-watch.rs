@@ -5,16 +5,13 @@
 use core::ffi::{c_char, c_int};
 
 use rustclip::cli::{Arg, ArgParser, get_args_iter};
-use rustclip::error::{ConnectionExt, write_wire_diagnostic};
+use rustclip::error::write_wire_diagnostic;
 use rustclip::io::write_stderr;
 use rustclip::mime::MimeType;
 use rustclip::state::{Action, State};
 use rustclip::syscall::signal::{SIG_IGN, SIGCHLD, signal};
 use wllib::dispatch::dispatch_once;
-use wllib::protocols::zwlr_data_control_manager_v1;
 use wllib::registry::crawl;
-use wllib::wire::Message;
-
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn main(argc: isize, argv: *const *mut c_char) -> c_int {
@@ -77,25 +74,14 @@ pub unsafe extern "C" fn main(argc: isize, argv: *const *mut c_char) -> c_int {
     return 1;
   }
 
-  if state.global.manager_id == 0 {
-    write_stderr(b"[wl-watch]: compositor does not support wlr-data-control\n");
-    return 1;
-  }
-  if state.global.seat_id == 0 {
-    write_stderr(b"[wl-watch]: no wl_seat found\n");
+  if !state.global.require("wl-watch") {
     return 1;
   }
 
-  let device_id = conn.alloc_id();
-  let mut msg = Message::new(
-    state.global.manager_id,
-    zwlr_data_control_manager_v1::request::GET_DATA_DEVICE,
-  );
-
-  msg.write_u32(device_id);
-  msg.write_u32(state.global.seat_id);
-  conn.send_logged(&msg, None);
-  state.device_id = device_id;
+  if let Err(e) = state.create_device(&mut conn) {
+    write_wire_diagnostic("wl-watch", &e);
+    return 1;
+  }
 
   // main wayland event dispatch loop
   loop {

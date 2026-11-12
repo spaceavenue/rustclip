@@ -2,73 +2,132 @@
 #![no_main]
 #![allow(clippy::result_large_err)]
 
-// `wl-copy` doesn't use `wllib::dispatch`/`EventHandler` for its runtime loop, because
-// `zwlr_data_control_source_v1::send` hands this process a file descriptor as ancillary data which
-// `dispatch_once`'s loop has no way to carry back to a handler. it wasn't designed around any event
-// needing more than the plain argument bytes. so, this binary runs its own loop directly on top of
-// `Connection::recv_with_fd`, and only uses `crawl`/`GlobalHandler` for the registry phase.
-
 use core::ffi::{c_char, c_int};
 
 use rustclip::cli::{Arg, ArgParser, get_args_iter};
+use rustclip::error::{AppError, write_wire_diagnostic};
+use rustclip::fmt_lite::StringOnStack;
+use rustclip::io::{write_fd, write_stderr};
 use rustclip::mime::{self, GENERIC_TEXT_OFFERS, MimeType, infer_from_fd};
+use rustclip::state::Global;
 use rustclip::syscall::{Fork, fork};
 use rustix::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use rustix::fs::{MemfdFlags, SeekFrom, ftruncate, memfd_create, seek};
 use rustix::io::read;
 use rustix::stdio::stdin;
-use rustclip::error::{AppError, ConnectionExt, write_wire_diagnostic};
-use rustclip::io::{write_fd, write_stderr};
-use wllib::dispatch::EventHandler;
+use wllib::dispatch::{EventHandler, dispatch_once};
 use wllib::error::{SysError, SysResultExt, WireError};
-use wllib::fmt_lite::StringOnStack;
 use wllib::protocols::{
   zwlr_data_control_device_v1, zwlr_data_control_manager_v1, zwlr_data_control_source_v1,
 };
-use wllib::registry::{GlobalHandler, bind, clamp_version, crawl};
-use wllib::transport::Connection;
-use wllib::wire::{Message, parse_header};
-
-#[derive(Default)]
-struct Global {
-  seat_id: u32,
-  manager_id: u32,
-}
+use wllib::registry::{GlobalHandler, crawl};
+use wllib::transport::{Connection, Ctx};
+use wllib::wire::{Message, Writer};
 
 struct State {
   global: Global,
+  memfd: OwnedFd,
+  source_id: u32,
+  paste_once: bool,
+  finished: bool,
 }
 
 impl GlobalHandler for State {
-  fn on_global(&mut self, conn: &mut Connection, name: u32, interface: &str, version: u32) {
-    match interface {
-      "wl_seat" => {
-        if self.global.seat_id != 0 {
-          return;
-        }
-        let id = conn.alloc_id();
-        match bind(conn, name, interface, clamp_version(1, version), id) {
-          Ok(()) => self.global.seat_id = id,
-          Err(e) => write_wire_diagnostic("wl-copy", &e),
-        }
-      }
-      "zwlr_data_control_manager_v1" => {
-        let id = conn.alloc_id();
-        match bind(conn, name, interface, clamp_version(2, version), id) {
-          Ok(()) => self.global.manager_id = id,
-          Err(e) => write_wire_diagnostic("wl-copy", &e),
-        }
-      }
-      _ => (),
-    }
+  fn on_global(
+    &mut self,
+    cx: &mut Ctx<'_>,
+    name: u32,
+    interface: &str,
+    version: u32,
+  ) -> Result<(), WireError> {
+    self.global.bind_global(cx, name, interface, version)
   }
 }
 
-// stub for satisfying `crawl`'s EventHandler trait bound.
 impl EventHandler for State {
-  fn handle_event(&mut self, _conn: &mut Connection, _sender: u32, _opcode: u16, _data: &[u8]) {}
+  // serve `send`/`cancelled` events.
+  fn handle_event(&mut self, cx: &mut Ctx<'_>, msg: Message<'_>) -> Result<(), WireError> {
+    if msg.header.object_id != self.source_id {
+      return Ok(());
+    }
+    match msg.header.opcode {
+      zwlr_data_control_source_v1::event::SEND => {
+        if let Some(target_fd) = cx.pop_fd() {
+          let _ = write_content_to_fd(self.memfd.as_fd(), &target_fd);
+          if self.paste_once {
+            self.finished = true;
+          }
+        } else {
+          write_stderr("[wl-copy]: got a send event with no accompanying fd, ignoring\n");
+        }
+      }
+      zwlr_data_control_source_v1::event::CANCELLED => self.finished = true,
+      _ => (),
+    }
+    Ok(())
+  }
 }
 
+fn offer<const N: usize>(
+  conn: &Connection<N>,
+  source_id: u32,
+  mime: &str,
+) -> Result<(), WireError> {
+  let mut w = Writer::<192>::new(source_id, zwlr_data_control_source_v1::request::OFFER);
+  w.str(mime);
+  conn.send(w.finish()?, &[])
+}
+
+// create the source, install it as the selection, and unless `foreground`, fork into the
+// background. returns `Ok(false)` in the parent after forking, where there's nothing left to do.
+fn setup<const N: usize>(
+  conn: &mut Connection<N>,
+  state: &mut State,
+  primary_mime: Option<&str>,
+  use_primary: bool,
+  foreground: bool,
+) -> Result<bool, AppError> {
+  let manager_id = state.global.manager_id;
+
+  let source_id = conn.alloc_id()?;
+  let mut w = Writer::<16>::new(
+    manager_id,
+    zwlr_data_control_manager_v1::request::CREATE_DATA_SOURCE,
+  );
+  w.u32(source_id);
+  conn.send(w.finish()?, &[])?;
+  state.source_id = source_id;
+
+  if let Some(m) = primary_mime {
+    offer(conn, source_id, m)?;
+  }
+  if primary_mime.is_none_or(mime::is_text_mime) {
+    for &pref in &GENERIC_TEXT_OFFERS {
+      if primary_mime != Some(pref) {
+        offer(conn, source_id, pref)?;
+      }
+    }
+  }
+
+  let device_id = state.global.create_device(conn)?;
+
+  let set_selection_opcode = if use_primary {
+    zwlr_data_control_device_v1::request::SET_PRIMARY_SELECTION
+  } else {
+    zwlr_data_control_device_v1::request::SET_SELECTION
+  };
+  let mut w = Writer::<16>::new(device_id, set_selection_opcode);
+  w.u32(source_id);
+  conn.send(w.finish()?, &[])?;
+
+  if !foreground {
+    return match fork().syserr("fork")? {
+      Fork::Child => Ok(true),
+      Fork::Parent(_) => Ok(false),
+    };
+  }
+  Ok(true)
+}
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn main(argc: isize, argv: *const *mut c_char) -> c_int {
@@ -103,7 +162,7 @@ pub unsafe extern "C" fn main(argc: isize, argv: *const *mut c_char) -> c_int {
         wanted_mime = parser.next_val().map(MimeType::from);
       }
       Arg::Value(val) => {
-        if let Err(e) = write_args_to_fd(&memfd, val) {
+        if let Err(e) = write_args_to_fd(&memfd, val, is_stdin) {
           e.write_diagnostic();
           return 1;
         }
@@ -140,117 +199,42 @@ pub unsafe extern "C" fn main(argc: isize, argv: *const *mut c_char) -> c_int {
 
   let mut state = State {
     global: Global::default(),
+    memfd,
+    source_id: 0,
+    paste_once,
+    finished: false,
   };
   if let Err(e) = crawl(&mut conn, &mut state) {
     write_wire_diagnostic("wl-copy", &e);
     return 1;
   }
 
-  if state.global.manager_id == 0 {
-    write_stderr("[wl-copy]: compositor does not support wlr-data-control\n");
+  if !state.global.require("wl-copy") {
     return 1;
   }
-  if state.global.seat_id == 0 {
-    write_stderr("[wl-copy]: no wl_seat found\n");
-    return 1;
-  }
-  let manager_id = state.global.manager_id;
-  let seat_id = state.global.seat_id;
-
-  let source_id = conn.alloc_id();
-  let mut create_msg = Message::new(
-    manager_id,
-    zwlr_data_control_manager_v1::request::CREATE_DATA_SOURCE,
-  );
-  create_msg.write_u32(source_id);
-  conn.send_logged(&create_msg, None);
 
   let primary_mime: Option<&str> = wanted_mime
     .as_ref()
     .map(StringOnStack::as_str)
     .or(inferred_mime.as_ref().map(StringOnStack::as_str));
 
-  if let Some(m) = primary_mime {
-    let mut offer_msg = Message::new(source_id, zwlr_data_control_source_v1::request::OFFER);
-    offer_msg.write_str(m);
-    conn.send_logged(&offer_msg, None);
-  }
-  // can unwrap() here since we are already checking if it's None. if that check doesnt pass it is
-  // bound to be Some.
-  if primary_mime.is_none() || mime::is_text_mime(primary_mime.unwrap()) {
-    for &pref in &GENERIC_TEXT_OFFERS {
-      if primary_mime != Some(pref) {
-        let mut offer_msg = Message::new(source_id, zwlr_data_control_source_v1::request::OFFER);
-        offer_msg.write_str(pref);
-        conn.send_logged(&offer_msg, None);
-      }
+  match setup(&mut conn, &mut state, primary_mime, use_primary, foreground) {
+    Ok(true) => {}
+    Ok(false) => return 0,
+    Err(e) => {
+      e.write_diagnostic();
+      return 1;
     }
   }
 
-  let device_id = conn.alloc_id();
-  let mut device_msg = Message::new(
-    manager_id,
-    zwlr_data_control_manager_v1::request::GET_DATA_DEVICE,
-  );
-  device_msg.write_u32(device_id);
-  device_msg.write_u32(seat_id);
-  conn.send_logged(&device_msg, None);
-
-  let set_selection_opcode = if use_primary {
-    zwlr_data_control_device_v1::request::SET_PRIMARY_SELECTION
-  } else {
-    zwlr_data_control_device_v1::request::SET_SELECTION
-  };
-  let mut select_msg = Message::new(device_id, set_selection_opcode);
-  select_msg.write_u32(source_id);
-  conn.send_logged(&select_msg, None);
-
-  if !foreground {
-    match fork().syserr("fork") {
-      Ok(Fork::Child) => {}
-      Ok(Fork::Parent(_)) => return 0,
-      Err(e) => {
-        write_wire_diagnostic("wl-copy", &e);
-        return 1;
-      }
-    }
-  }
-
-  // serve `send`/`cancelled` events on the child's source until someone else takes over the
-  // selection (or with -o, until we've served exactly one request).
-  loop {
-    let mut buf = [0u8; 4096];
-    let (result, mut fd) = conn.recv_with_fd(&mut buf);
-    let data = match result {
-      Ok(items) => items,
+  while !state.finished {
+    match dispatch_once(&mut conn, &mut state) {
+      Ok(()) => {}
       Err(WireError::ConnectionClosed) => break,
       Err(e) => {
         write_wire_diagnostic("wl-copy", &e);
         break;
       }
-    };
-
-    let mut idx = 0;
-    while let Some(header) = parse_header(data, idx) {
-      if header.sender == source_id {
-        match header.opcode {
-          zwlr_data_control_source_v1::event::SEND => {
-            if let Some(target_fd) = fd.take() {
-              let _ = write_content_to_fd(memfd.as_fd(), &target_fd, true);
-              if paste_once {
-                return 0;
-              }
-            } else {
-              write_stderr("[wl-copy]: got a send event with no accompanying fd, ignoring\n");
-            }
-          }
-          zwlr_data_control_source_v1::event::CANCELLED => {
-            return 0;
-          }
-          _ => (),
-        }
-      }
-      idx += header.size as usize;
     }
   }
   0
@@ -275,11 +259,7 @@ fn trim_trailing_newline(fd: &OwnedFd) {
 }
 
 /// writes data from `source_fd` to `target_fd`
-fn write_content_to_fd(
-  source_fd: BorrowedFd,
-  target_fd: &OwnedFd,
-  _close: bool,
-) -> Result<(), AppError> {
+fn write_content_to_fd(source_fd: BorrowedFd, target_fd: &OwnedFd) -> Result<(), AppError> {
   // if not stdin, reset the file offset of the fd to the beginning before copying.
   if source_fd.as_raw_fd() != 0 {
     seek(source_fd, SeekFrom::Start(0)).syserr("seek")?;
@@ -298,11 +278,14 @@ fn write_content_to_fd(
 /// writes whatever was received from stdin to the given fd
 fn write_stdin_to_fd(fd: &OwnedFd) -> Result<(), AppError> {
   let stdin = unsafe { stdin() };
-  write_content_to_fd(stdin, fd, false)
+  write_content_to_fd(stdin, fd)
 }
 
-fn write_args_to_fd(fd: &OwnedFd, val: &str) -> Result<(), AppError> {
-  write_fd(fd, b" ", Some(1)).map_err(AppError::Sys)?;
+/// writes arguments to the fd. `first` suppresses the space (' ') before the first arg.
+fn write_args_to_fd(fd: &OwnedFd, val: &str, first: bool) -> Result<(), AppError> {
+  if !first {
+    write_fd(fd, b" ", None).map_err(AppError::Sys)?;
+  }
   write_fd(fd, val.as_bytes(), None).map_err(AppError::Sys)?;
   Ok(())
 }

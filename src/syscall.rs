@@ -6,9 +6,9 @@ use core::hint::unreachable_unchecked;
 use core::ptr;
 
 use rustix::io::Errno;
-use wllib::fmt_lite::StringOnStack;
 
 use crate::env::{get_env, get_envp};
+use crate::fmt_lite::StringOnStack;
 
 const SYS_FORK: usize = 57;
 const SYS_EXECVE: usize = 59;

@@ -28,9 +28,9 @@ use rustix::pipe::{PipeFlags, pipe_with};
 use rustix::process::{Pid, WaitOptions, waitpid};
 use rustix::stdio;
 use wllib::error::SysResultExt;
-use wllib::fmt_lite::StringOnStack;
 
 use crate::exit;
+use crate::fmt_lite::StringOnStack;
 use crate::signal::{SIG_DFL, SIGHUP, SIGPIPE, signal};
 use crate::syscall::{Fork, execvp, fork};
 
