@@ -116,14 +116,14 @@ pub fn sniff_mime(buf: &[u8]) -> Option<&'static str> {
 pub fn path_for_fd<Fd: AsFd>(fd: Fd) -> Option<StringOnStack<256>> {
   let mut proc_path = StringOnStack::<64>::new();
   proc_path
-    .push_str("/proc/self/fd/")
-    .push_i32(fd.as_fd().as_raw_fd());
+    .push("/proc/self/fd/")
+    .push(fd.as_fd().as_raw_fd());
 
   let mut buf = [0u8; 256];
   let n = readlinkat_raw(CWD, proc_path.as_c_str(), &mut buf).ok()?;
   let s = str::from_utf8(&buf[..n]).ok()?;
   let mut res = StringOnStack::<256>::new();
-  res.push_str(s);
+  res.push(s);
   Some(res)
 }
 
